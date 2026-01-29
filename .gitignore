@@ -1,11 +1,28 @@
-# Python
+# ===== Python =====
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+*.egg-info/
 .venv/
+venv/
 
-# Node
-node_modules/
+# ===== Build / Dist =====
+build/
+dist/
+*.spec
 
-# OS
+# ===== Executables / archives =====
+*.exe
+*.zip
+
+# ===== Logs =====
+*.log
+*.txt
+
+# ===== OS =====
 .DS_Store
 Thumbs.db
+
+# ===== VS Code =====
+.vscode/
