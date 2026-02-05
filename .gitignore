@@ -1,3 +1,18 @@
+# Node / JS
+node_modules/
+
+# Python
+__pycache__/
+.venv/
+
+# Build output
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
+
 # ===== Python =====
 __pycache__/
 *.pyc
