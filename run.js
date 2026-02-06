@@ -1,7 +1,8 @@
+const inquirer = require("inquirer").default;
+const clipboardy = require("clipboardy").default;
 const verifyDocmanUsers = require("./verifyDocmanUsers");
 
 (async () => {
-  const inquirer = (await import("inquirer")).default;
   const answers = await inquirer.prompt([
     {
       type: "input",
@@ -22,8 +23,7 @@ const verifyDocmanUsers = require("./verifyDocmanUsers");
     {
       type: "editor",
       name: "usernames",
-      message:
-        "Paste Docman usernames to verify (one per line):"
+      message: "Paste Docman usernames to verify (one per line):"
     }
   ]);
 
@@ -41,4 +41,27 @@ const verifyDocmanUsers = require("./verifyDocmanUsers");
 
   console.log("\nVerification results:");
   console.table(results);
+
+  // ✅ Collect ONLY valid Docman usernames (exact, unchanged)
+  const validDocmanUsers = results
+    .filter(r => r.exists && r.docmanUsername)
+    .map(r => r.docmanUsername);
+
+  if (!validDocmanUsers.length) {
+    console.log("\nNo valid Docman users found.");
+    return;
+  }
+
+  const outputBlock = validDocmanUsers.join("\n");
+
+  console.log("\n========================================");
+  console.log("READY FOR BETTERLETTER EXTENSION");
+  console.log("(copy below)");
+  console.log("========================================\n");
+  console.log(outputBlock);
+  console.log("\n========================================");
+
+  await clipboardy.write(outputBlock);
+  console.log("Copied to clipboard ✔");
+  console.log("========================================");
 })();

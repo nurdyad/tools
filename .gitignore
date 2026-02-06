@@ -41,3 +41,10 @@ Thumbs.db
 
 # ===== VS Code =====
 .vscode/
+
+# Ignore agent/config docs
+AGENTS.md
+
+# Ignore Node package files
+package.json
+package-lock.json

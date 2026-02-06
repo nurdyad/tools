@@ -47,33 +47,51 @@ async function verifyDocmanUsers({
     for (const username of usernames) {
       const filter = page.locator("#Filter_Criteria");
 
-      // Clear + type search
-      await filter.fill("");
-      await filter.type(username, { delay: 50 });
-      await filter.press("Enter");
+      async function runSearch(term) {
+        await filter.fill("");
+        await filter.type(term, { delay: 50 });
+        await filter.press("Enter");
 
-      // Wait for Docman to rebuild the table
-      await page.waitForFunction(() => {
-        const rows = document.querySelectorAll("table tbody tr");
-        return rows.length > 0;
-      }, { timeout: 15000 });
+        try {
+          await page.waitForFunction(() => {
+            const rows = document.querySelectorAll("table tbody tr");
+            return rows.length > 0;
+          }, { timeout: 6000 });
 
-      let foundUsername = null;
+          const link = page.locator(
+            "table tbody tr:first-child td:first-child a"
+          );
 
-      const firstRowLink = page.locator(
-        "table tbody tr:first-child td:first-child a"
-      );
+          if (await link.count()) {
+            return await link.innerText();
+          }
+        } catch {
+          return null;
+        }
 
-      if (await firstRowLink.count()) {
-        foundUsername = (await firstRowLink.innerText())
-          .replace(/^\*/, "")
-          .trim();
+        return null;
+      }
+
+      // 1️⃣ Full name search first
+      let exactMatch = await runSearch(username);
+      let partialMatches = [];
+
+      if (!exactMatch) {
+        const parts = username.split(" ").filter(Boolean);
+
+        for (const part of parts) {
+          const match = await runSearch(part);
+          if (match && !partialMatches.includes(match)) {
+            partialMatches.push(match);
+          }
+        }
       }
 
       results.push({
         searchedName: username,
-        exists: Boolean(foundUsername),
-        docmanUsername: foundUsername
+        exists: Boolean(exactMatch),
+        docmanUsername: exactMatch,
+        partialMatches: partialMatches.length ? partialMatches : null
       });
     }
 

@@ -11,6 +11,7 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "clipboardy": "^5.2.1",
     "inquirer": "^13.2.2",
     "playwright": "^1.58.1"
   }
