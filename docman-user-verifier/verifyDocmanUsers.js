@@ -91,7 +91,8 @@ async function verifyDocmanUsers({
         searchedName: username,
         exists: Boolean(exactMatch),
         docmanUsername: exactMatch,
-        partialMatches: partialMatches.length ? partialMatches : null
+        partialMatches: partialMatches.length ? partialMatches : null,
+        needsManualReview: !exactMatch && partialMatches.length > 0
       });
     }
 
