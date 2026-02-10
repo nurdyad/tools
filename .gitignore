@@ -1,5 +1,22 @@
 # Node / JS
 node_modules/
+package.json
+package-lock.json
+
+# Browser automation / profiles
+.browser-profile/
+automation/.browser-profile/
+automation/**/.browser-profile/
+
+# Chrome / browser junk
+*.log
+*.png
+*.db
+*.journal
+Cache/
+Code Cache/
+GPUCache/
+ShaderCache/
 
 # Python
 __pycache__/
