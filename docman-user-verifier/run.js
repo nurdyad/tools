@@ -22,10 +22,11 @@ const cleanBetterLetterProcessing = require("./cleanBetterLetterProcessing");
       console.log("Cancelled.");
       return;
     }
+    console.log("Using basic auth user:", "mailroom_admin");
 
     console.log("🔗 Bootstrapping BetterLetter → Docman session…");
 
-    // ✅ Option B: hardcode HTTP Basic Auth here (browser-level popup)
+    // ✅ HTTP Basic Auth hardcoded here (browser popup layer)
     session = await bootstrapDocmanSession(practiceName.trim(), {
       httpCredentials: {
         username: "mailroom_admin",
@@ -47,7 +48,22 @@ const cleanBetterLetterProcessing = require("./cleanBetterLetterProcessing");
       },
     ]);
 
+    console.log(`✅ Mode selected: ${mode}`);
+
+    if (mode === "clean") {
+      console.log("🧹 Starting CLEAN workflow…");
+      await cleanBetterLetterProcessing({
+        page,
+        batchSize: 50,
+        dryRun: false,
+      });
+      console.log("✅ CLEAN workflow finished.");
+      return;
+    }
+
     if (mode === "verify") {
+      console.log("🔍 Starting VERIFY workflow…");
+
       const { usernamesRaw } = await inquirer.prompt([
         {
           type: "editor",
@@ -88,18 +104,11 @@ const cleanBetterLetterProcessing = require("./cleanBetterLetterProcessing");
         console.log("\nNo valid Docman users found.");
       }
 
+      console.log("✅ VERIFY workflow finished.");
       return;
     }
 
-    if (mode === "clean") {
-      await cleanBetterLetterProcessing({
-        page,
-        batchSize: 50,
-        dryRun: false,
-      });
-      console.log("\n✔ Done.");
-      return;
-    }
+    console.log("Unknown mode selected:", mode);
   } catch (err) {
     console.error("\n❌ FAILED:", err?.message || err);
   } finally {

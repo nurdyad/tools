@@ -84,8 +84,21 @@ async function getBrowserSession(options = {}) {
     const page = context.pages()[0] || (await context.newPage());
     await page.bringToFront();
 
+    // Exit Node when the browser window is closed
+
+    let closingByScript = false;
+
+    context.on("close", () => {
+      if (!closingByScript) {
+        console.log("[browserSession] Browser window closed — exiting.");
+        process.exit(0);
+      }
+    });
+
+    // When you close it yourself (normal shutdown), set the flag:
     const cleanup = async () => {
       try {
+        closingByScript = true;
         await context.close();
       } catch (_) {}
       releaseLock();
