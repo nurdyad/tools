@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "BetterLetter → Docman Helper",
+  "version": "1.0.0",
+  "description": "Fetches Docman credentials from BetterLetter and logs into Docman.",
+  "permissions": [
+    "storage",
+    "tabs",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://app.betterletter.ai/*",
+    "https://production.docman.thirdparty.nhs.uk/*",
+    "https://*.docman.thirdparty.nhs.uk/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "BetterLetter → Docman",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://app.betterletter.ai/*"],
+      "js": ["content-betterletter.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://*.docman.thirdparty.nhs.uk/*"],
+      "js": ["content-docman.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
