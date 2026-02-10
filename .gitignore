@@ -6,7 +6,6 @@ package-lock.json
 # Browser automation / profiles
 .browser-profile/
 automation/.browser-profile/
-automation/**/.browser-profile/
 
 # Chrome / browser junk
 *.log
