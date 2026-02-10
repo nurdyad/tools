@@ -97,33 +97,55 @@ async function promptUntilFolderExists(page, promptMsg) {
 
 // Finds folder by scrolling INSIDE the folder pane until found or end.
 async function findFolderLink(page, folderName) {
-  const tree = page.locator("#folders_list").first();
+  const tree = page.locator("#folders_list, #folders").first();
   await tree.waitFor({ timeout: 60000 });
 
-  // scroll reset to top
+  const target = folderName.trim();
+
+  // Scroll to top
   await tree.evaluate((el) => (el.scrollTop = 0));
 
-  for (let i = 0; i < 80; i++) {
-    const link = tree.locator(
-      `xpath=.//a[.//span[normalize-space(text())="${folderName}"]]`
-    );
+  // Helper: try several robust strategies
+  async function tryFind() {
+    // 1) Exact match in any element inside folder pane
+    const exactXpath = `xpath=.//*[normalize-space(text())="${target}"]`;
+    const exact = tree.locator(exactXpath).first();
+    if (await exact.count()) return exact;
 
-    if (await link.count()) return link.first();
+    // 2) Case-insensitive contains match (handles extra suffix like "Surgery")
+    const lower = target.toLowerCase();
+    const containsXpath =
+      `xpath=.//*[contains(translate(normalize-space(text()), ` +
+      `"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"), "${lower}")]`;
+    const contains = tree.locator(containsXpath).first();
+    if (await contains.count()) return contains;
 
-    // scroll down
+    return null;
+  }
+
+  for (let i = 0; i < 120; i++) {
+    const hit = await tryFind();
+    if (hit) {
+      // The visible text node may not be clickable; click the closest clickable ancestor
+      const clickable = hit.locator("xpath=ancestor-or-self::a[1] | ancestor-or-self::button[1] | ancestor-or-self::li[1]");
+      if (await clickable.count()) return clickable.first();
+      return hit;
+    }
+
+    // scroll down inside pane
     const didScroll = await tree.evaluate((el) => {
       const before = el.scrollTop;
       el.scrollTop = before + el.clientHeight * 0.9;
       return el.scrollTop !== before;
     });
 
-    if (!didScroll) break; // reached end
-
-    await page.waitForTimeout(80);
+    if (!didScroll) break;
+    await page.waitForTimeout(60);
   }
 
   return null;
 }
+
 
 async function loadFilingFolder(page, folderName) {
   console.log(`➡ Opening folder: "${folderName}"`);

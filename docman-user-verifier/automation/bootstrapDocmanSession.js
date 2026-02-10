@@ -20,6 +20,14 @@ async function bootstrapDocmanSession(practiceName, sessionOptions = {}) {
   // 3) Ensure Docman is logged in (reuse if still valid)
   await ensureDocmanLoggedIn(page, { odsCode, adminUsername, adminPassword });
 
+  // ensure Docman is logged into the correct org/practice
+  const currentOrg = await getCurrentDocmanOrgName(page);
+  if (currentOrg && !practiceMatches(practiceName, currentOrg)) {
+    console.log(`⚠ Docman currently in org "${currentOrg}" but expected "${practiceName}". Re-authing…`);
+    await logoutDocman(page);
+    await ensureDocmanLoggedIn(page, { odsCode, adminUsername, adminPassword });
+  }
+
   // 4) Clear any post-login modal(s)
   await waitAndDismissBlockingDialogs(page, "after docman login");
 
@@ -257,6 +265,53 @@ async function ensureDocmanLoggedIn(page, { odsCode, adminUsername, adminPasswor
 
   console.log("✔ Docman login completed.");
   return true;
+}
+
+async function getCurrentDocmanOrgName(page) {
+  // In your screenshot it looks like:
+  // "Mr Dyad Betterletter (Docman System Administrator) - HEATHVIEW MEDICAL PRACTICE"
+  // We'll grab text containing "Docman System" then take the part after " - ".
+  const header = page.locator('text=/Docman System/i').first();
+  const visible = await header.isVisible({ timeout: 1500 }).catch(() => false);
+  if (visible) {
+    const t = (await header.innerText().catch(() => "")) || "";
+    const idx = t.lastIndexOf(" - ");
+    if (idx !== -1) return t.slice(idx + 3).trim();
+  }
+
+  // Fallback: scan body text for " - SOME PRACTICE"
+  const body = (await page.textContent("body").catch(() => "")) || "";
+  const m = body.match(/-\s*([A-Z0-9][A-Z0-9 \-']{3,})/);
+  return m ? m[1].trim() : null;
+}
+
+function practiceMatches(expectedPracticeName, docmanOrgName) {
+  if (!expectedPracticeName || !docmanOrgName) return false;
+  const a = expectedPracticeName.trim().toLowerCase();
+  const b = docmanOrgName.trim().toLowerCase();
+
+  // allow partial match either direction (Alrewas vs ALREWAS SURGERY)
+  return a.includes(b) || b.includes(a);
+}
+
+async function logoutDocman(page) {
+  // Best-effort sign out. Many Docman deployments support /Account/Logout.
+  // Even if it doesn't, we still handle the result safely.
+  await page.goto("https://production.docman.thirdparty.nhs.uk/Account/Logout", {
+    waitUntil: "domcontentloaded",
+    timeout: 60000,
+  }).catch(() => {});
+
+  // If logout route isn't supported, try clicking User menu → Logout (best-effort)
+  const userMenu = page.locator('text=/User/i').first();
+  const userVisible = await userMenu.isVisible({ timeout: 1500 }).catch(() => false);
+  if (userVisible) {
+    await userMenu.click().catch(() => {});
+    await page.locator('text=/Log out|Logout|Sign out/i').first().click().catch(() => {});
+  }
+
+  // After logout, we should end up on login page
+  await page.waitForTimeout(500);
 }
 
 
