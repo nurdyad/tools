@@ -17,16 +17,13 @@ async function bootstrapDocmanSession(practiceName, sessionOptions = {}) {
     practiceName
   );
 
-  // 3) Ensure Docman is logged in (reuse if still valid)
-  await ensureDocmanLoggedIn(page, { odsCode, adminUsername, adminPassword });
-
-  // ensure Docman is logged into the correct org/practice
-  const currentOrg = await getCurrentDocmanOrgName(page);
-  if (currentOrg && !practiceMatches(practiceName, currentOrg)) {
-    console.log(`⚠ Docman currently in org "${currentOrg}" but expected "${practiceName}". Re-authing…`);
-    await logoutDocman(page);
-    await ensureDocmanLoggedIn(page, { odsCode, adminUsername, adminPassword });
-  }
+  // 3) Ensure Docman is logged in and scoped to the target practice where possible.
+  await ensureDocmanSessionForPractice(page, {
+    practiceName,
+    odsCode,
+    adminUsername,
+    adminPassword,
+  });
 
   // 4) Clear any post-login modal(s)
   await waitAndDismissBlockingDialogs(page, "after docman login");
@@ -233,19 +230,20 @@ async function ensureDocmanLoggedIn(page, { odsCode, adminUsername, adminPasswor
 
   // Wait for fields and fill (supports both OrganisationCode and OdsCode variants)
   await orgField.waitFor({ timeout: 60000 });
-  await orgField.fill(odsCode);
+  await overwriteInput(orgField, odsCode);
 
   await userField.waitFor({ timeout: 60000 });
-  await userField.fill(adminUsername);
+  await overwriteInput(userField, adminUsername);
 
   await passField.waitFor({ timeout: 60000 });
-  await passField.fill(adminPassword);
+  await overwriteInput(passField, adminPassword);
 
   // Click submit
   const submit = page.locator('button[type="submit"], button:has-text("Sign In")').first();
-  await Promise.all([
+  await Promise.allSettled([
     submit.click(),
-    page.waitForLoadState("domcontentloaded"),
+    page.waitForLoadState("domcontentloaded", { timeout: 30000 }),
+    page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 30000 }),
   ]);
 
   // After submit, Docman may land somewhere else; ensure Filing is loaded
@@ -267,30 +265,120 @@ async function ensureDocmanLoggedIn(page, { odsCode, adminUsername, adminPasswor
   return true;
 }
 
-async function getCurrentDocmanOrgName(page) {
-  // In your screenshot it looks like:
-  // "Mr Dyad Betterletter (Docman System Administrator) - HEATHVIEW MEDICAL PRACTICE"
-  // We'll grab text containing "Docman System" then take the part after " - ".
-  const header = page.locator('text=/Docman System/i').first();
-  const visible = await header.isVisible({ timeout: 1500 }).catch(() => false);
-  if (visible) {
-    const t = (await header.innerText().catch(() => "")) || "";
-    const idx = t.lastIndexOf(" - ");
-    if (idx !== -1) return t.slice(idx + 3).trim();
+async function ensureDocmanSessionForPractice(page, {
+  practiceName,
+  odsCode,
+  adminUsername,
+  adminPassword,
+}) {
+  const state = await getDocmanAuthState(page);
+
+  if (!state.loggedIn) {
+    await ensureDocmanLoggedIn(page, { odsCode, adminUsername, adminPassword });
+    return;
   }
 
-  // Fallback: scan body text for " - SOME PRACTICE"
-  const body = (await page.textContent("body").catch(() => "")) || "";
-  const m = body.match(/-\s*([A-Z0-9][A-Z0-9 \-']{3,})/);
-  return m ? m[1].trim() : null;
+  if (!state.orgName) {
+    console.log("ℹ Reusing existing Docman session (organisation could not be confirmed).");
+    return;
+  }
+
+  if (practiceMatches(practiceName, state.orgName)) {
+    console.log(`✔ Reusing Docman session for organisation: ${state.orgName}`);
+    return;
+  }
+
+  console.log(
+    `⚠ Docman session is for "${state.orgName}" but expected "${practiceName}". Resetting Docman login…`
+  );
+
+  await logoutDocman(page);
+  await ensureDocmanLoggedIn(page, { odsCode, adminUsername, adminPassword });
+
+  const postLoginState = await getDocmanAuthState(page);
+  if (postLoginState.loggedIn && postLoginState.orgName && !practiceMatches(practiceName, postLoginState.orgName)) {
+    throw new Error(
+      `Docman logged in, but organisation is still "${postLoginState.orgName}" (expected "${practiceName}").`
+    );
+  }
+}
+
+async function overwriteInput(locator, value) {
+  await locator.click({ clickCount: 3 }).catch(() => {});
+  await locator.press("ControlOrMeta+A").catch(() => {});
+  await locator.press("Backspace").catch(() => {});
+  await locator.fill("");
+  await locator.type(value, { delay: 15 });
+}
+
+async function getDocmanAuthState(page) {
+  const filingUrl = "https://production.docman.thirdparty.nhs.uk/DocumentViewer/Filing";
+  await page.goto(filingUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+  await page.waitForTimeout(300);
+
+  const url = page.url();
+  const loginTextVisible = await page
+    .locator("text=/Sign in to Continue/i")
+    .first()
+    .isVisible({ timeout: 1000 })
+    .catch(() => false);
+
+  const orgFieldVisible = await page
+    .locator('#OrganisationCode, #OrganizationCode, #OdsCode, input[name="OrganisationCode"], input[name="OrganizationCode"], input[name="OdsCode"]')
+    .first()
+    .isVisible({ timeout: 1000 })
+    .catch(() => false);
+
+  const loggedIn = !(url.includes("/Account/Login") || loginTextVisible || orgFieldVisible);
+  if (!loggedIn) {
+    return { loggedIn: false, orgName: null };
+  }
+
+  const orgName = await getCurrentDocmanOrgName(page);
+  return { loggedIn: true, orgName };
+}
+
+async function getCurrentDocmanOrgName(page) {
+  const headerCandidates = [
+    '[class*="user" i]:has-text("Docman System")',
+    '[class*="profile" i]:has-text("Docman System")',
+    "header :text-matches('Docman System', 'i')",
+    'text=/Docman System/i',
+  ];
+
+  for (const selector of headerCandidates) {
+    const header = page.locator(selector).first();
+    const visible = await header.isVisible({ timeout: 700 }).catch(() => false);
+    if (!visible) continue;
+
+    const text = (await header.innerText().catch(() => "")) || "";
+    const idx = text.lastIndexOf(" - ");
+    if (idx !== -1) {
+      const org = text.slice(idx + 3).trim();
+      if (org) return org;
+    }
+  }
+
+  return null;
 }
 
 function practiceMatches(expectedPracticeName, docmanOrgName) {
   if (!expectedPracticeName || !docmanOrgName) return false;
-  const a = expectedPracticeName.trim().toLowerCase();
-  const b = docmanOrgName.trim().toLowerCase();
+  const normalize = (value) =>
+    value
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9 ]+/g, " ")
+      .replace(/\b(the|surgery|medical|practice|centre|center|health|clinic)\b/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
 
-  // allow partial match either direction (Alrewas vs ALREWAS SURGERY)
+  const a = normalize(expectedPracticeName);
+  const b = normalize(docmanOrgName);
+  if (!a || !b) return false;
+  if (a === b) return true;
+
+  // allow strong partial match for short naming differences
   return a.includes(b) || b.includes(a);
 }
 
