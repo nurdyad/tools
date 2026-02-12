@@ -56,16 +56,20 @@ async function sessionHealthCheck(page) {
     });
 
     const status = resp?.status?.();
+    const u = page.url();
+
     const bodyText = (await page.textContent("body").catch(() => "")) || "";
     const unauthorized =
       status === 401 ||
       status === 403 ||
       /unauthorized/i.test(bodyText);
 
-    const u = page.url();
-    const redirectedToLogin = u.includes("/users/log_in") || u.includes("/login");
+    const onSignIn =
+      u.includes("/sign-in") ||
+      u.includes("/users/log_in") ||
+      u.includes("/login");
 
-    blLoggedIn = !unauthorized && !redirectedToLogin;
+    blLoggedIn = !unauthorized && !onSignIn;
 
     console.log(
       `BetterLetter debug: status=${status ?? "n/a"} unauthorized=${unauthorized} url=${u}`
@@ -75,6 +79,7 @@ async function sessionHealthCheck(page) {
   }
 
   console.log(`BetterLetter: ${blLoggedIn ? "✅ Logged in" : "❌ Not logged in"}`);
+
 
   // ---------------- Docman check ----------------
   let dmLoggedIn = false;
@@ -153,26 +158,53 @@ async function ensureBetterLetterLoggedIn(page) {
     timeout: 60000,
   });
 
-  if (page.url().includes("/users/log_in") || page.url().includes("/login")) {
+  // New BetterLetter login route
+  const isLoginPage =
+    page.url().includes("/sign-in") ||
+    page.url().includes("/users/log_in") ||
+    page.url().includes("/login") ||
+    (await page.locator('input[type="email"], input[name="email"]').first()
+      .isVisible({ timeout: 800 })
+      .catch(() => false));
+
+  // Unauthorized page body check (basic auth failure / access denied)
+  const bodyText = ((await page.textContent("body").catch(() => "")) || "").trim();
+  if (/unauthorized/i.test(bodyText)) {
+    throw new Error(
+      "BetterLetter returned Unauthorized (HTTP Basic Auth failed). Check basic auth creds in run.js."
+    );
+  }
+
+  if (isLoginPage) {
     console.log("\n🔐 Please log into BetterLetter in the opened browser window.");
-    console.log("This is a one-time login (saved in the persistent profile).");
-    console.log("Then come back here and press ENTER.\n");
+    console.log("When finished, come back here and press ENTER.\n");
     await waitForEnter();
 
+    // After manual login, re-open practices
     await page.goto("https://app.betterletter.ai/admin_panel/practices", {
       waitUntil: "domcontentloaded",
       timeout: 60000,
     });
 
-    if (page.url().includes("/users/log_in") || page.url().includes("/login")) {
-      throw new Error(
-        "BetterLetter still shows login screen after manual login. Login may not have completed."
-      );
+    // Wait until we can see at least one practice link (Phoenix patch link)
+    await page.waitForSelector('a[href^="/admin_panel/practices/"]', {
+      timeout: 60000,
+    });
+
+    // If still on sign-in, fail clearly
+    if (page.url().includes("/sign-in")) {
+      throw new Error("BetterLetter still shows sign-in after manual login.");
     }
+  } else {
+    // Not a login page — still ensure practices list is present
+    await page.waitForSelector('a[href^="/admin_panel/practices/"]', {
+      timeout: 60000,
+    });
   }
 
   return true;
 }
+
 
 /* ------------ Docman helpers ------------ */
 
@@ -333,6 +365,79 @@ async function getDocmanAuthState(page) {
 
   const onLoginPage = await detectDocmanLoginPage(page, 1000);
   const loggedIn = !onLoginPage;
+  if (!loggedIn) {
+    return { loggedIn: false, orgName: null };
+  }
+
+  const orgName = await getCurrentDocmanOrgName(page);
+  return { loggedIn: true, orgName };
+}
+
+async function ensureDocmanSessionForPractice(page, {
+  practiceName,
+  odsCode,
+  adminUsername,
+  adminPassword,
+}) {
+  const state = await getDocmanAuthState(page);
+
+  if (!state.loggedIn) {
+    await ensureDocmanLoggedIn(page, { odsCode, adminUsername, adminPassword });
+    return;
+  }
+
+  if (!state.orgName) {
+    console.log("ℹ Reusing existing Docman session (organisation could not be confirmed).");
+    return;
+  }
+
+  if (practiceMatches(practiceName, state.orgName)) {
+    console.log(`✔ Reusing Docman session for organisation: ${state.orgName}`);
+    return;
+  }
+
+  console.log(
+    `⚠ Docman session is for "${state.orgName}" but expected "${practiceName}". Resetting Docman login…`
+  );
+
+  await logoutDocman(page);
+  await ensureDocmanLoggedIn(page, { odsCode, adminUsername, adminPassword });
+
+  const postLoginState = await getDocmanAuthState(page);
+  if (postLoginState.loggedIn && postLoginState.orgName && !practiceMatches(practiceName, postLoginState.orgName)) {
+    throw new Error(
+      `Docman logged in, but organisation is still "${postLoginState.orgName}" (expected "${practiceName}").`
+    );
+  }
+}
+
+async function overwriteInput(locator, value) {
+  await locator.click({ clickCount: 3 }).catch(() => {});
+  await locator.press("ControlOrMeta+A").catch(() => {});
+  await locator.press("Backspace").catch(() => {});
+  await locator.fill("");
+  await locator.type(value, { delay: 15 });
+}
+
+async function getDocmanAuthState(page) {
+  const filingUrl = "https://production.docman.thirdparty.nhs.uk/DocumentViewer/Filing";
+  await page.goto(filingUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+  await page.waitForTimeout(300);
+
+  const url = page.url();
+  const loginTextVisible = await page
+    .locator("text=/Sign in to Continue/i")
+    .first()
+    .isVisible({ timeout: 1000 })
+    .catch(() => false);
+
+  const orgFieldVisible = await page
+    .locator('#OrganisationCode, #OrganizationCode, #OdsCode, input[name="OrganisationCode"], input[name="OrganizationCode"], input[name="OdsCode"]')
+    .first()
+    .isVisible({ timeout: 1000 })
+    .catch(() => false);
+
+  const loggedIn = !(url.includes("/Account/Login") || loginTextVisible || orgFieldVisible);
   if (!loggedIn) {
     return { loggedIn: false, orgName: null };
   }
