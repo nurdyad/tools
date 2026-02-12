@@ -17,16 +17,13 @@ async function bootstrapDocmanSession(practiceName, sessionOptions = {}) {
     practiceName
   );
 
-  // 3) Ensure Docman is logged in (reuse if still valid)
-  await ensureDocmanLoggedIn(page, { odsCode, adminUsername, adminPassword });
-
-  // ensure Docman is logged into the correct org/practice
-  const currentOrg = await getCurrentDocmanOrgName(page);
-  if (currentOrg && !practiceMatches(practiceName, currentOrg)) {
-    console.log(`⚠ Docman currently in org "${currentOrg}" but expected "${practiceName}". Re-authing…`);
-    await logoutDocman(page);
-    await ensureDocmanLoggedIn(page, { odsCode, adminUsername, adminPassword });
-  }
+  // 3) Ensure Docman is logged in and scoped to the target practice where possible.
+  await ensureDocmanSessionForPractice(page, {
+    practiceName,
+    odsCode,
+    adminUsername,
+    adminPassword,
+  });
 
   // 4) Clear any post-login modal(s)
   await waitAndDismissBlockingDialogs(page, "after docman login");
@@ -179,120 +176,238 @@ async function ensureBetterLetterLoggedIn(page) {
 
 /* ------------ Docman helpers ------------ */
 
+function getDocmanLoginFieldLocators(page) {
+  return {
+    orgField: page.locator('#OrganisationCode, #OrganizationCode, #OdsCode, input[name="OrganisationCode"], input[name="OrganizationCode"], input[name="OdsCode"]').first(),
+    userField: page.locator('#UserName, #Username, input[name="UserName"], input[name="Username"]').first(),
+    passField: page.locator('#Password, input[name="Password"], input[type="password"]').first(),
+  };
+}
+
+async function detectDocmanLoginPage(page, timeout = 1200) {
+  const { orgField, userField, passField } = getDocmanLoginFieldLocators(page);
+
+  const loginTextVisible = await page
+    .locator("text=/Sign in to Continue|sign in/i")
+    .first()
+    .isVisible({ timeout })
+    .catch(() => false);
+
+  const orgVisible = await orgField.isVisible({ timeout }).catch(() => false);
+  const userVisible = await userField.isVisible({ timeout }).catch(() => false);
+  const passVisible = await passField.isVisible({ timeout }).catch(() => false);
+
+  const url = page.url();
+  return (
+    url.includes("/Account/Login") ||
+    url.includes("/login") ||
+    loginTextVisible ||
+    (orgVisible && userVisible && passVisible)
+  );
+}
+
 async function ensureDocmanLoggedIn(page, { odsCode, adminUsername, adminPassword }) {
   const filingUrl =
     "https://production.docman.thirdparty.nhs.uk/DocumentViewer/Filing";
 
-  console.log("➡ Checking Docman session (attempting Filing directly)...");
-  const resp = await page.goto(filingUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    console.log(`➡ Checking Docman session (attempt ${attempt}/2)...`);
+    const resp = await page.goto(filingUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
+    await page.waitForTimeout(250);
 
-  // Give SPA/login redirects a moment to settle
-  await page.waitForTimeout(500);
+    const status = resp?.status?.();
+    const onLoginPage = await detectDocmanLoginPage(page, 1000);
 
-  const url = page.url();
-  const status = resp?.status?.();
+    console.log(
+      `[Docman auth check] status=${status ?? "n/a"} url=${page.url()} onLoginPage=${onLoginPage}`
+    );
 
-  // ✅ Detect login by URL OR by visible login form text/fields
-  const loginTextVisible = await page
-    .locator("text=/Sign in to Continue/i")
-    .first()
-    .isVisible({ timeout: 1500 })
-    .catch(() => false);
+    if (!onLoginPage) {
+      console.log("✔ Docman appears already logged in (reused session).");
+      return true;
+    }
 
-  const orgField = page.locator(
-    '#OrganisationCode, #OrganizationCode, #OdsCode, input[name="OrganisationCode"], input[name="OrganizationCode"], input[name="OdsCode"]'
-  ).first();
+    console.log(`🔐 Docman login required. Logging in for ODS: ${odsCode}`);
 
-  const userField = page.locator(
-    '#UserName, #Username, input[name="UserName"], input[name="Username"]'
-  ).first();
+    const { orgField, userField, passField } = getDocmanLoginFieldLocators(page);
 
-  const passField = page.locator(
-    '#Password, input[name="Password"], input[type="password"]'
-  ).first();
+    await orgField.waitFor({ timeout: 30000 });
+    await overwriteInput(orgField, odsCode);
 
-  const orgVisible = await orgField.isVisible({ timeout: 1500 }).catch(() => false);
-  const userVisible = await userField.isVisible({ timeout: 1500 }).catch(() => false);
-  const passVisible = await passField.isVisible({ timeout: 1500 }).catch(() => false);
+    await userField.waitFor({ timeout: 30000 });
+    await overwriteInput(userField, adminUsername);
 
-  const onLoginPage =
-    url.includes("/Account/Login") ||
-    loginTextVisible ||
-    (orgVisible && userVisible && passVisible);
+    await passField.waitFor({ timeout: 30000 });
+    await overwriteInput(passField, adminPassword);
+
+    const submit = page.locator('button[type="submit"], button:has-text("Sign In"), input[type="submit"]').first();
+    await submit.click({ timeout: 10000 });
+
+    await Promise.race([
+      page.waitForURL((url) => !url.toString().includes("/Account/Login"), { timeout: 10000 }).catch(() => null),
+      page.waitForLoadState("domcontentloaded", { timeout: 10000 }).catch(() => null),
+      page.waitForTimeout(1200),
+    ]);
+
+    await waitAndDismissBlockingDialogs(page, "after docman login", {
+      maxWindowMs: 2500,
+      pollMs: 150,
+      settleMs: 500,
+    });
+
+    await page.goto(filingUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
+    const stillLogin = await detectDocmanLoginPage(page, 1000);
+    if (!stillLogin) {
+      console.log("✔ Docman login completed.");
+      return true;
+    }
+
+    console.log("⚠ Login did not stick on this attempt; retrying once...");
+    await logoutDocman(page);
+  }
+
+  throw new Error(
+    "Docman login did not complete after 2 attempts. This could be wrong creds, SSO restriction, or an extra prompt."
+  );
+}
+
+async function ensureDocmanSessionForPractice(page, {
+  practiceName,
+  odsCode,
+  adminUsername,
+  adminPassword,
+}) {
+  const state = await getDocmanAuthState(page);
+
+  if (!state.loggedIn) {
+    await ensureDocmanLoggedIn(page, { odsCode, adminUsername, adminPassword });
+
+    const postLoginState = await getDocmanAuthState(page);
+    if (postLoginState.loggedIn && postLoginState.orgName && !practiceMatches(practiceName, postLoginState.orgName)) {
+      throw new Error(
+        `Docman logged in, but organisation is "${postLoginState.orgName}" (expected "${practiceName}").`
+      );
+    }
+    return;
+  }
+
+  if (!state.orgName) {
+    console.log("ℹ Existing Docman session found, but organisation is unknown. Re-authenticating once for safety.");
+    await logoutDocman(page);
+    await ensureDocmanLoggedIn(page, { odsCode, adminUsername, adminPassword });
+
+    const postLoginState = await getDocmanAuthState(page);
+    if (postLoginState.loggedIn && postLoginState.orgName && !practiceMatches(practiceName, postLoginState.orgName)) {
+      throw new Error(
+        `Docman logged in, but organisation is "${postLoginState.orgName}" (expected "${practiceName}").`
+      );
+    }
+    return;
+  }
+
+  if (practiceMatches(practiceName, state.orgName)) {
+    console.log(`✔ Reusing Docman session for organisation: ${state.orgName}`);
+    return;
+  }
 
   console.log(
-    `[Docman auth check] status=${status ?? "n/a"} url=${url} onLoginPage=${onLoginPage}`
+    `⚠ Docman session is for "${state.orgName}" but expected "${practiceName}". Resetting Docman login…`
   );
 
-  if (!onLoginPage) {
-    console.log("✔ Docman appears already logged in (reused session).");
-    return true;
-  }
+  await logoutDocman(page);
+  await ensureDocmanLoggedIn(page, { odsCode, adminUsername, adminPassword });
 
-  console.log(`🔐 Docman login required. Logging in for ODS: ${odsCode}`);
-
-  // Wait for fields and fill (supports both OrganisationCode and OdsCode variants)
-  await orgField.waitFor({ timeout: 60000 });
-  await orgField.fill(odsCode);
-
-  await userField.waitFor({ timeout: 60000 });
-  await userField.fill(adminUsername);
-
-  await passField.waitFor({ timeout: 60000 });
-  await passField.fill(adminPassword);
-
-  // Click submit
-  const submit = page.locator('button[type="submit"], button:has-text("Sign In")').first();
-  await Promise.all([
-    submit.click(),
-    page.waitForLoadState("domcontentloaded"),
-  ]);
-
-  // After submit, Docman may land somewhere else; ensure Filing is loaded
-  await page.goto(filingUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-
-  // Final verification: if still login, fail clearly
-  const stillLogin =
-    page.url().includes("/Account/Login") ||
-    (await page.locator("text=/Sign in to Continue/i").first().isVisible({ timeout: 1500 }).catch(() => false));
-
-  if (stillLogin) {
+  const postLoginState = await getDocmanAuthState(page);
+  if (postLoginState.loggedIn && postLoginState.orgName && !practiceMatches(practiceName, postLoginState.orgName)) {
     throw new Error(
-      "Docman login did not complete (still on login page after submitting). " +
-      "This could be wrong creds, SSO restriction, or extra prompt."
+      `Docman logged in, but organisation is still "${postLoginState.orgName}" (expected "${practiceName}").`
     );
   }
+}
 
-  console.log("✔ Docman login completed.");
-  return true;
+async function overwriteInput(locator, value) {
+  await locator.click({ clickCount: 3 }).catch(() => {});
+  await locator.press("ControlOrMeta+A").catch(() => {});
+  await locator.press("Backspace").catch(() => {});
+  await locator.fill("");
+  await locator.type(value, { delay: 15 });
+}
+
+async function getDocmanAuthState(page) {
+  const filingUrl = "https://production.docman.thirdparty.nhs.uk/DocumentViewer/Filing";
+  await page.goto(filingUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+  await page.waitForTimeout(300);
+
+  const onLoginPage = await detectDocmanLoginPage(page, 1000);
+  const loggedIn = !onLoginPage;
+  if (!loggedIn) {
+    return { loggedIn: false, orgName: null };
+  }
+
+  const orgName = await getCurrentDocmanOrgName(page);
+  return { loggedIn: true, orgName };
 }
 
 async function getCurrentDocmanOrgName(page) {
-  // In your screenshot it looks like:
-  // "Mr Dyad Betterletter (Docman System Administrator) - HEATHVIEW MEDICAL PRACTICE"
-  // We'll grab text containing "Docman System" then take the part after " - ".
-  const header = page.locator('text=/Docman System/i').first();
-  const visible = await header.isVisible({ timeout: 1500 }).catch(() => false);
-  if (visible) {
-    const t = (await header.innerText().catch(() => "")) || "";
-    const idx = t.lastIndexOf(" - ");
-    if (idx !== -1) return t.slice(idx + 3).trim();
+  const headerCandidates = [
+    '[class*="user" i]:has-text("Docman System")',
+    '[class*="profile" i]:has-text("Docman System")',
+    "header :text-matches('Docman System', 'i')",
+    'text=/Docman System/i',
+  ];
+
+  for (const selector of headerCandidates) {
+    const header = page.locator(selector).first();
+    const visible = await header.isVisible({ timeout: 700 }).catch(() => false);
+    if (!visible) continue;
+
+    const text = (await header.innerText().catch(() => "")) || "";
+    const idx = text.lastIndexOf(" - ");
+    if (idx !== -1) {
+      const org = text.slice(idx + 3).trim();
+      if (org) return org;
+    }
   }
 
-  // Fallback: scan body text for " - SOME PRACTICE"
-  const body = (await page.textContent("body").catch(() => "")) || "";
-  const m = body.match(/-\s*([A-Z0-9][A-Z0-9 \-']{3,})/);
-  return m ? m[1].trim() : null;
+  return null;
 }
 
 function practiceMatches(expectedPracticeName, docmanOrgName) {
   if (!expectedPracticeName || !docmanOrgName) return false;
-  const a = expectedPracticeName.trim().toLowerCase();
-  const b = docmanOrgName.trim().toLowerCase();
 
-  // allow partial match either direction (Alrewas vs ALREWAS SURGERY)
-  return a.includes(b) || b.includes(a);
+  const normalizeBasic = (value) =>
+    value
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9 ]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+  const normalizeForComparison = (value) =>
+    normalizeBasic(value)
+      .replace(
+        /\b(the|surgery|medical|practice|centre|center|health|clinic)\b/g,
+        " "
+      )
+      .replace(/\s+/g, " ")
+      .trim();
+
+  const rawA = normalizeBasic(expectedPracticeName);
+  const rawB = normalizeBasic(docmanOrgName);
+  const a = normalizeForComparison(expectedPracticeName);
+  const b = normalizeForComparison(docmanOrgName);
+
+  const matches = (x, y) => x === y || x.includes(y) || y.includes(x);
+
+  if (a && b) return matches(a, b);
+
+  // If aggressive normalization strips everything (e.g. "The Surgery"),
+  // fall back to basic normalized names to avoid false mismatches.
+  if (rawA && rawB) return matches(rawA, rawB);
+
+  return false;
 }
+
 
 async function logoutDocman(page) {
   // Best-effort sign out. Many Docman deployments support /Account/Logout.
@@ -330,7 +445,6 @@ async function gotoDocmanFilingAndActivate(page) {
   // Close "Restore pages?" popup if it blocks clicks (best-effort)
   await dismissRestorePagesPopup(page);
 
-  await waitAndDismissBlockingDialogs(page, "after filing navigation");
 
   // Filing UI might be in an iframe — pick the best frame
   const frame = await getDocmanFilingFrame(page);
@@ -432,21 +546,21 @@ function waitForEnter() {
   });
 }
 
-async function waitAndDismissBlockingDialogs(
-  page,
-  reason = "unknown",
-  windowMs = 10000,
-  pollMs = 500
-) {
+async function waitAndDismissBlockingDialogs(page, reason = "unknown", options = {}) {
+  const { maxWindowMs = 3000, pollMs = 150, settleMs = 700 } = options;
+
   console.log(`⏳ Watching for blocking dialogs (${reason})`);
 
   const start = Date.now();
   let dismissedAny = false;
+  let lastSeenAt = Date.now();
 
-  while (Date.now() - start < windowMs) {
+  while (Date.now() - start < maxWindowMs) {
     const modal = page.locator(".alertify.ajs-in, .alertify.ajs-fade.ajs-in");
+    const hasModal = (await modal.count().catch(() => 0)) > 0;
 
-    if (await modal.count()) {
+    if (hasModal) {
+      lastSeenAt = Date.now();
       dismissedAny = true;
       console.log("⚠ Blocking dialog detected — dismissing");
 
@@ -460,6 +574,12 @@ async function waitAndDismissBlockingDialogs(
       } else {
         await page.keyboard.press("Escape").catch(() => {});
       }
+      await page.waitForTimeout(120);
+      continue;
+    }
+
+    if (dismissedAny && Date.now() - lastSeenAt >= settleMs) {
+      break;
     }
 
     await page.waitForTimeout(pollMs);
