@@ -2,34 +2,59 @@
 const { getBrowserSession } = require("./browserSession");
 const { fetchDocmanCreds } = require("./fetchDocmanCreds");
 
-async function bootstrapDocmanSession(practiceName, sessionOptions = {}) {
+async function bootstrapDocmanSession(practiceInput, sessionOptions = {}) {
   const { context, page } = await getBrowserSession(sessionOptions);
 
-  // Session health check (prints current auth status)
-  await sessionHealthCheck(page);
-
-  // 1) BetterLetter (persistent session)
-  await ensureBetterLetterLoggedIn(page);
-
-  // 2) Fetch Docman creds from BetterLetter
-  const { odsCode, adminUsername, adminPassword } = await fetchDocmanCreds(
-    page,
-    practiceName
+  printPhaseBanner(
+    "DOCMAN BOOTSTRAP",
+    [
+      "0) Enter/select target practice",
+      "1) Session health check",
+      "2) Login to BetterLetter (manual username/password/2FA if prompted)",
+      "3) Read Docman credentials from BetterLetter",
+      "4) Ensure Docman is logged into the correct practice",
+      "5) Dismiss blocking dialogs",
+    ]
   );
 
-  // 3) Ensure Docman is logged in and scoped to the target practice where possible.
+  // 0) Resolve target practice.
+  printPhaseBanner("Step 0", ["Collect target practice"]);
+  const practiceName =
+    typeof practiceInput === "function"
+      ? await practiceInput({ page })
+      : practiceInput;
+
+  if (!practiceName || !practiceName.trim()) {
+    throw new Error("Practice name is required.");
+  }
+
+  // 1) Session health check (prints current auth status)
+  printPhaseBanner("Step 1", ["Session health check"]);
+  await sessionHealthCheck(page);
+
+  // 2) BetterLetter (persistent session)
+  printPhaseBanner("Step 2", ["Login to BetterLetter"]);
+  await ensureBetterLetterLoggedIn(page);
+
+  // 3) Fetch Docman creds from BetterLetter
+  printPhaseBanner("Step 3", ["Read Docman ODS/username/password from BetterLetter"]);
+  const { odsCode, adminUsername, adminPassword } = await fetchDocmanCreds(
+    page,
+    practiceName.trim()
+  );
+
+  // 4) Ensure Docman is logged in and scoped to the target practice where possible.
+  printPhaseBanner("Step 4", ["Validate Docman session and log out/re-login if wrong practice"]);
   await ensureDocmanSessionForPractice(page, {
-    practiceName,
+    practiceName: practiceName.trim(),
     odsCode,
     adminUsername,
     adminPassword,
   });
 
-  // 4) Clear any post-login modal(s)
+  // 5) Clear any post-login modal(s)
+  printPhaseBanner("Step 5", ["Dismiss blocking dialogs"]);
   await waitAndDismissBlockingDialogs(page, "after docman login");
-
-  // 5) Navigate to Filing (and activate)
-  await gotoDocmanFilingAndActivate(page);
 
   return {
     context,
@@ -93,42 +118,13 @@ async function sessionHealthCheck(page) {
     // Give redirects a moment
     await page.waitForTimeout(300);
 
-    const status = resp?.status?.();
-    const url = page.url();
-
-    const loginTextVisible = await page
-      .locator("text=/Sign in to Continue/i")
-      .first()
-      .isVisible({ timeout: 1200 })
-      .catch(() => false);
-
-    const orgFieldVisible = await page
-      .locator('#OrganisationCode, #OrganizationCode, #OdsCode, input[name="OrganisationCode"], input[name="OrganizationCode"], input[name="OdsCode"]')
-      .first()
-      .isVisible({ timeout: 1200 })
-      .catch(() => false);
-
-    const userFieldVisible = await page
-      .locator('#UserName, #Username, input[name="UserName"], input[name="Username"]')
-      .first()
-      .isVisible({ timeout: 1200 })
-      .catch(() => false);
-
-    const passFieldVisible = await page
-      .locator('#Password, input[name="Password"], input[type="password"]')
-      .first()
-      .isVisible({ timeout: 1200 })
-      .catch(() => false);
-
-    const onLoginPage =
-      url.includes("/Account/Login") ||
-      loginTextVisible ||
-      (orgFieldVisible && userFieldVisible && passFieldVisible);
+    const authSurface = await inspectDocmanAuthSurface(page, 6000);
+    const onLoginPage = authSurface.onLoginPage;
 
     dmLoggedIn = !onLoginPage;
 
     console.log(
-      `Docman debug: status=${status ?? "n/a"} url=${url} onLoginPage=${onLoginPage}`
+      `Docman debug: status=${resp?.status?.() ?? "n/a"} url=${authSurface.url} onLoginPage=${onLoginPage}`
     );
   } catch (e) {
     console.log("Docman: ⚠ Unable to determine (navigation issue)");
@@ -213,44 +209,17 @@ async function ensureDocmanLoggedIn(page, { odsCode, adminUsername, adminPasswor
     "https://production.docman.thirdparty.nhs.uk/DocumentViewer/Filing";
 
   console.log("➡ Checking Docman session (attempting Filing directly)...");
-  const resp = await page.goto(filingUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-
-  // Give SPA/login redirects a moment to settle
+  const resp = await page.goto(filingUrl, {
+    waitUntil: "domcontentloaded",
+    timeout: 60000,
+  });
   await page.waitForTimeout(500);
 
-  const url = page.url();
-  const status = resp?.status?.();
-
-  // ✅ Detect login by URL OR by visible login form text/fields
-  const loginTextVisible = await page
-    .locator("text=/Sign in to Continue/i")
-    .first()
-    .isVisible({ timeout: 1500 })
-    .catch(() => false);
-
-  const orgField = page.locator(
-    '#OrganisationCode, #OrganizationCode, #OdsCode, input[name="OrganisationCode"], input[name="OrganizationCode"], input[name="OdsCode"]'
-  ).first();
-
-  const userField = page.locator(
-    '#UserName, #Username, input[name="UserName"], input[name="Username"]'
-  ).first();
-
-  const passField = page.locator(
-    '#Password, input[name="Password"], input[type="password"]'
-  ).first();
-
-  const orgVisible = await orgField.isVisible({ timeout: 1500 }).catch(() => false);
-  const userVisible = await userField.isVisible({ timeout: 1500 }).catch(() => false);
-  const passVisible = await passField.isVisible({ timeout: 1500 }).catch(() => false);
-
-  const onLoginPage =
-    url.includes("/Account/Login") ||
-    loginTextVisible ||
-    (orgVisible && userVisible && passVisible);
+  const authState = await inspectDocmanAuthSurface(page, 8000);
+  const onLoginPage = authState.onLoginPage;
 
   console.log(
-    `[Docman auth check] status=${status ?? "n/a"} url=${url} onLoginPage=${onLoginPage}`
+    `[Docman auth check] status=${resp?.status?.() ?? "n/a"} url=${authState.url} onLoginPage=${onLoginPage}`
   );
 
   if (!onLoginPage) {
@@ -260,18 +229,21 @@ async function ensureDocmanLoggedIn(page, { odsCode, adminUsername, adminPasswor
 
   console.log(`🔐 Docman login required. Logging in for ODS: ${odsCode}`);
 
+  const { orgField, userField, passField } = getDocmanLoginFieldLocators(page);
+
   // Wait for fields and fill (supports both OrganisationCode and OdsCode variants)
   await orgField.waitFor({ timeout: 60000 });
-  await overwriteInput(orgField, odsCode);
+  await overwriteInput(orgField, odsCode, "Organisation Code");
 
   await userField.waitFor({ timeout: 60000 });
-  await overwriteInput(userField, adminUsername);
+  await overwriteInput(userField, adminUsername, "User Name");
 
   await passField.waitFor({ timeout: 60000 });
-  await overwriteInput(passField, adminPassword);
+  await overwriteInput(passField, adminPassword, "Password");
 
   // Click submit
   const submit = page.locator('button[type="submit"], button:has-text("Sign In")').first();
+  await submit.waitFor({ timeout: 30000 });
   await Promise.allSettled([
     submit.click(),
     page.waitForLoadState("domcontentloaded", { timeout: 30000 }),
@@ -281,15 +253,16 @@ async function ensureDocmanLoggedIn(page, { odsCode, adminUsername, adminPasswor
   // After submit, Docman may land somewhere else; ensure Filing is loaded
   await page.goto(filingUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
 
-  // Final verification: if still login, fail clearly
-  const stillLogin =
-    page.url().includes("/Account/Login") ||
-    (await page.locator("text=/Sign in to Continue/i").first().isVisible({ timeout: 1500 }).catch(() => false));
+  // Final verification: if still on login/auth hand-off page, fail clearly.
+  const postLoginState = await inspectDocmanAuthSurface(page, 12000);
+  const stillLogin = postLoginState.onLoginPage;
 
   if (stillLogin) {
+    await page.screenshot({ path: "docman-login-failed.png", fullPage: true }).catch(() => {});
     throw new Error(
       "Docman login did not complete (still on login page after submitting). " +
-      "This could be wrong creds, SSO restriction, or extra prompt."
+      "This could be wrong creds, SSO restriction, or extra prompt. " +
+      `Current URL: ${postLoginState.url}. Screenshot: docman-login-failed.png`
     );
   }
 
@@ -311,7 +284,11 @@ async function ensureDocmanSessionForPractice(page, {
   }
 
   if (!state.orgName) {
-    console.log("ℹ Reusing existing Docman session (organisation could not be confirmed).");
+    console.log(
+      "⚠ Existing Docman session detected but organisation could not be confirmed after checks. Logging out immediately and performing a fresh login."
+    );
+    await logoutDocman(page);
+    await ensureDocmanLoggedIn(page, { odsCode, adminUsername, adminPassword });
     return;
   }
 
@@ -335,33 +312,30 @@ async function ensureDocmanSessionForPractice(page, {
   }
 }
 
-async function overwriteInput(locator, value) {
+async function overwriteInput(locator, value, label = "field") {
   await locator.click({ clickCount: 3 }).catch(() => {});
   await locator.press("ControlOrMeta+A").catch(() => {});
   await locator.press("Backspace").catch(() => {});
   await locator.fill("");
   await locator.type(value, { delay: 15 });
+
+  const typed = await locator.inputValue().catch(() => "");
+  if (typed !== value) {
+    await locator.fill(value);
+  }
+
+  const finalValue = await locator.inputValue().catch(() => "");
+  if (finalValue !== value) {
+    throw new Error(`Docman ${label} did not stick in the input field.`);
+  }
 }
 
 async function getDocmanAuthState(page) {
   const filingUrl = "https://production.docman.thirdparty.nhs.uk/DocumentViewer/Filing";
   await page.goto(filingUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
   await page.waitForTimeout(300);
-
-  const url = page.url();
-  const loginTextVisible = await page
-    .locator("text=/Sign in to Continue/i")
-    .first()
-    .isVisible({ timeout: 1000 })
-    .catch(() => false);
-
-  const orgFieldVisible = await page
-    .locator('#OrganisationCode, #OrganizationCode, #OdsCode, input[name="OrganisationCode"], input[name="OrganizationCode"], input[name="OdsCode"]')
-    .first()
-    .isVisible({ timeout: 1000 })
-    .catch(() => false);
-
-  const loggedIn = !(url.includes("/Account/Login") || loginTextVisible || orgFieldVisible);
+  const authSurface = await inspectDocmanAuthSurface(page, 8000);
+  const loggedIn = !authSurface.onLoginPage;
   if (!loggedIn) {
     return { loggedIn: false, orgName: null };
   }
@@ -371,27 +345,97 @@ async function getDocmanAuthState(page) {
 }
 
 async function getCurrentDocmanOrgName(page) {
-  const headerCandidates = [
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const org = await detectDocmanOrgName(page);
+    if (org) return org;
+
+    // Some tenants only reveal org details after opening user/profile menu.
+    await tryOpenDocmanUserMenu(page);
+    const orgAfterMenu = await detectDocmanOrgName(page);
+    if (orgAfterMenu) return orgAfterMenu;
+
+    await page.waitForTimeout(250);
+  }
+  return null;
+}
+
+async function detectDocmanOrgName(page) {
+  const selectors = [
     '[class*="user" i]:has-text("Docman System")',
     '[class*="profile" i]:has-text("Docman System")',
+    '[class*="org" i]',
+    '[id*="org" i]',
     "header :text-matches('Docman System', 'i')",
     'text=/Docman System/i',
   ];
 
-  for (const selector of headerCandidates) {
-    const header = page.locator(selector).first();
-    const visible = await header.isVisible({ timeout: 700 }).catch(() => false);
+  // Main page selectors.
+  for (const selector of selectors) {
+    const loc = page.locator(selector).first();
+    const visible = await loc.isVisible({ timeout: 500 }).catch(() => false);
     if (!visible) continue;
 
-    const text = (await header.innerText().catch(() => "")) || "";
-    const idx = text.lastIndexOf(" - ");
-    if (idx !== -1) {
-      const org = text.slice(idx + 3).trim();
-      if (org) return org;
-    }
+    const text = (await loc.innerText().catch(() => "")) || "";
+    const org = extractOrgFromText(text);
+    if (org) return org;
+  }
+
+  // Fall back to frame text scanning.
+  for (const frame of page.frames()) {
+    const bodyText = await frame
+      .locator("body")
+      .first()
+      .innerText()
+      .catch(() => "");
+    const org = extractOrgFromText(bodyText || "");
+    if (org) return org;
   }
 
   return null;
+}
+
+function extractOrgFromText(text) {
+  if (!text) return null;
+
+  const compact = text.replace(/\s+/g, " ").trim();
+  if (!compact) return null;
+
+  const patterns = [
+    /Docman System\s*-\s*([^|\n\r]+)/i,
+    /Organisation\s*:\s*([^|\n\r]+)/i,
+    /Organization\s*:\s*([^|\n\r]+)/i,
+    /Practice\s*:\s*([^|\n\r]+)/i,
+  ];
+
+  for (const pattern of patterns) {
+    const m = compact.match(pattern);
+    if (!m) continue;
+    const candidate = (m[1] || "").trim();
+    if (candidate && candidate.length >= 2) return candidate;
+  }
+
+  return null;
+}
+
+async function tryOpenDocmanUserMenu(page) {
+  const userMenuCandidates = [
+    'button:has-text("User")',
+    'a:has-text("User")',
+    '[class*="user" i] button',
+    '[class*="profile" i] button',
+    '[class*="avatar" i]',
+  ];
+
+  for (const selector of userMenuCandidates) {
+    const menu = page.locator(selector).first();
+    const visible = await menu.isVisible({ timeout: 400 }).catch(() => false);
+    if (!visible) continue;
+    await menu.click().catch(() => {});
+    await page.waitForTimeout(120);
+    return true;
+  }
+
+  return false;
 }
 
 function practiceMatches(expectedPracticeName, docmanOrgName) {
@@ -443,6 +487,15 @@ async function gotoDocmanFilingAndActivate(page) {
     waitUntil: "domcontentloaded",
     timeout: 60000,
   });
+
+  const filingAuthState = await inspectDocmanAuthSurface(page, 8000);
+  if (filingAuthState.onLoginPage) {
+    await page.screenshot({ path: "docman-filing-login-page.png", fullPage: true }).catch(() => {});
+    throw new Error(
+      "Docman is still on the login page while trying to open Filing. " +
+      `Current URL: ${filingAuthState.url}. Screenshot: docman-filing-login-page.png`
+    );
+  }
 
   // Give SPAs time to render
   await page.waitForLoadState("networkidle").catch(() => {});
@@ -519,6 +572,115 @@ async function getDocmanFilingFrame(page) {
   return candidate;
 }
 
+function getDocmanLoginFieldLocators(page) {
+  return {
+    orgField: page
+      .locator(
+        [
+          "#OrganisationCode",
+          "#OrganizationCode",
+          "#OdsCode",
+          'input[name="OrganisationCode"]',
+          'input[name="OrganizationCode"]',
+          'input[name="OdsCode"]',
+          'input[name*="organisation" i]',
+          'input[name*="organization" i]',
+          'input[placeholder*="organisation" i]',
+          'input[placeholder*="organization" i]',
+        ].join(", ")
+      )
+      .first(),
+    userField: page
+      .locator(
+        [
+          "#UserName",
+          "#Username",
+          'input[name="UserName"]',
+          'input[name="Username"]',
+          'input[name*="user" i]',
+          'input[autocomplete="username"]',
+        ].join(", ")
+      )
+      .first(),
+    passField: page
+      .locator(
+        [
+          "#Password",
+          'input[name="Password"]',
+          'input[type="password"]',
+          'input[autocomplete="current-password"]',
+        ].join(", ")
+      )
+      .first(),
+  };
+}
+
+async function inspectDocmanAuthSurface(page, timeoutMs = 6000) {
+  const start = Date.now();
+
+  while (Date.now() - start < timeoutMs) {
+    const url = page.url();
+    const lowerUrl = url.toLowerCase();
+
+    const { orgField, userField, passField } = getDocmanLoginFieldLocators(page);
+
+    const loginByUrl =
+      lowerUrl.includes("/account/login") ||
+      lowerUrl.includes("/account/prelogin");
+
+    const signInHeadingVisible = await page
+      .locator("text=/Sign in to Continue/i")
+      .first()
+      .isVisible({ timeout: 250 })
+      .catch(() => false);
+
+    const autoSignInFailedVisible = await page
+      .locator("text=/automatic sign-in failed/i")
+      .first()
+      .isVisible({ timeout: 250 })
+      .catch(() => false);
+
+    const orgVisible = await orgField.isVisible({ timeout: 250 }).catch(() => false);
+    const userVisible = await userField.isVisible({ timeout: 250 }).catch(() => false);
+    const passVisible = await passField.isVisible({ timeout: 250 }).catch(() => false);
+
+    const filingUiVisible = await page
+      .locator(
+        [
+          "span.all-docs-count",
+          "#folders_list",
+          "#folders",
+          '[id*="folder" i]',
+          '[class*="folder" i]',
+          "text=/Filing/i",
+        ].join(", ")
+      )
+      .first()
+      .isVisible({ timeout: 250 })
+      .catch(() => false);
+
+    const onLoginPage =
+      loginByUrl ||
+      signInHeadingVisible ||
+      autoSignInFailedVisible ||
+      (orgVisible && (userVisible || passVisible));
+
+    if (onLoginPage || filingUiVisible) {
+      return { onLoginPage, url };
+    }
+
+    await page.waitForTimeout(250);
+  }
+
+  const timeoutUrl = page.url();
+  const timeoutLower = timeoutUrl.toLowerCase();
+  return {
+    onLoginPage:
+      timeoutLower.includes("/account/login") || timeoutLower.includes("/account/prelogin"),
+    url: timeoutUrl,
+  };
+}
+
 async function waitForAnySelector(frame, selectors, timeoutMs) {
   const start = Date.now();
   let lastErr = null;
@@ -545,6 +707,17 @@ async function waitForAnySelector(frame, selectors, timeoutMs) {
 
 /* ------------ helpers ------------ */
 
+function printPhaseBanner(title, lines = []) {
+  const width = 62;
+  const bar = "=".repeat(width);
+  console.log(`\n${bar}`);
+  console.log(` ${title}`);
+  for (const line of lines) {
+    console.log(` - ${line}`);
+  }
+  console.log(`${bar}\n`);
+}
+
 function waitForEnter() {
   return new Promise((resolve) => {
     process.stdin.resume();
@@ -555,19 +728,22 @@ function waitForEnter() {
 async function waitAndDismissBlockingDialogs(
   page,
   reason = "unknown",
-  windowMs = 10000,
-  pollMs = 500
+  windowMs = 5000,
+  pollMs = 250
 ) {
   console.log(`⏳ Watching for blocking dialogs (${reason})`);
 
   const start = Date.now();
   let dismissedAny = false;
+  let lastModalSeenAt = null;
+  const quietExitMs = 1200;
 
   while (Date.now() - start < windowMs) {
     const modal = page.locator(".alertify.ajs-in, .alertify.ajs-fade.ajs-in");
 
     if (await modal.count()) {
       dismissedAny = true;
+      lastModalSeenAt = Date.now();
       console.log("⚠ Blocking dialog detected — dismissing");
 
       const btn = modal
@@ -580,6 +756,14 @@ async function waitAndDismissBlockingDialogs(
       } else {
         await page.keyboard.press("Escape").catch(() => {});
       }
+    } else {
+      const now = Date.now();
+      if (!dismissedAny && now - start >= quietExitMs) {
+        break;
+      }
+      if (dismissedAny && lastModalSeenAt && now - lastModalSeenAt >= quietExitMs) {
+        break;
+      }
     }
 
     await page.waitForTimeout(pollMs);
@@ -590,3 +774,4 @@ async function waitAndDismissBlockingDialogs(
 }
 
 module.exports = bootstrapDocmanSession;
+module.exports.gotoDocmanFilingAndActivate = gotoDocmanFilingAndActivate;

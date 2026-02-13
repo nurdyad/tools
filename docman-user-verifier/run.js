@@ -10,24 +10,22 @@ const cleanBetterLetterProcessing = require("./cleanBetterLetterProcessing");
   let session = null;
 
   try {
-    const { practiceName } = await inquirer.prompt([
-      {
-        type: "input",
-        name: "practiceName",
-        message: "Enter Practice Name (as shown in BetterLetter):",
-      },
-    ]);
-
-    if (!practiceName?.trim()) {
-      console.log("Cancelled.");
-      return;
-    }
     console.log("Using basic auth user:", "mailroom_admin");
 
     console.log("🔗 Bootstrapping BetterLetter → Docman session…");
 
     // ✅ HTTP Basic Auth hardcoded here (browser popup layer)
-    session = await bootstrapDocmanSession(practiceName.trim(), {
+    session = await bootstrapDocmanSession(async () => {
+      const { practiceName } = await inquirer.prompt([
+        {
+          type: "input",
+          name: "practiceName",
+          message: "Enter Practice Name (as shown in BetterLetter):",
+        },
+      ]);
+
+      return practiceName;
+    }, {
       httpCredentials: {
         username: "mailroom_admin",
         password: "Yxbq95wbYhp0sAbR8xmV",
@@ -41,6 +39,7 @@ const cleanBetterLetterProcessing = require("./cleanBetterLetterProcessing");
         type: "list",
         name: "mode",
         message: "What would you like to do?",
+        default: "verify",
         choices: [
           { name: "Verify Docman users (copy valid names)", value: "verify" },
           { name: "Clean folder (move NON-UUID documents)", value: "clean" },
@@ -51,6 +50,26 @@ const cleanBetterLetterProcessing = require("./cleanBetterLetterProcessing");
     console.log(`✅ Mode selected: ${mode}`);
 
     if (mode === "clean") {
+      const { confirmClean } = await inquirer.prompt([
+        {
+          type: "confirm",
+          name: "confirmClean",
+          default: false,
+          message:
+            "CLEAN mode moves documents between folders. Continue with CLEAN?",
+        },
+      ]);
+
+      if (!confirmClean) {
+        console.log("Cancelled CLEAN workflow.");
+        return;
+      }
+
+      if (typeof bootstrapDocmanSession.gotoDocmanFilingAndActivate === "function") {
+        console.log("➡ Preparing Docman Filing for CLEAN workflow…");
+        await bootstrapDocmanSession.gotoDocmanFilingAndActivate(page);
+      }
+
       console.log("🧹 Starting CLEAN workflow…");
       await cleanBetterLetterProcessing({
         page,
