@@ -51,7 +51,8 @@ async function cleanBetterLetterProcessing({ page, batchSize = 50, dryRun = fals
     // DESTINATION
     const destinationFolder = await promptUntilFolderExists(
       scope,
-      "Enter destination folder name (exact match):"
+      "Enter destination folder name (exact match):",
+      { nonDisruptive: true }
     );
     if (!destinationFolder) return;
 
@@ -63,6 +64,14 @@ async function cleanBetterLetterProcessing({ page, batchSize = 50, dryRun = fals
       return;
     }
 
+    // Destination lookup can change the UI context in some tenants.
+    // Re-open source folder to guarantee we select the intended documents.
+    await withTimeout(
+      loadFilingFolder(scope, sourceFolder),
+      20000,
+      `Timed out reloading source folder "${sourceFolder}" before move`
+    );
+
     // MOVE
     await ensureSelectMode(scope);
 
@@ -73,9 +82,13 @@ async function cleanBetterLetterProcessing({ page, batchSize = 50, dryRun = fals
       const current = remaining.slice(0, batchSize);
       console.log(`\nBatch ${batch}: moving ${current.length}`);
 
+      await dismissTransientBlockingModals(scope, "before selecting documents");
       await selectDocumentsByTitle(scope, current);
+      await dismissTransientBlockingModals(scope, "after selecting documents");
       await openChangeFolder(scope);
+      await dismissTransientBlockingModals(scope, "before choosing destination folder");
       await moveToFolder(scope, destinationFolder);
+      await dismissTransientBlockingModals(scope, "after confirming move");
 
       remaining = remaining.slice(batchSize);
       batch++;
@@ -131,6 +144,61 @@ async function waitForTimeout(scope, ms) {
   await getScopePage(scope).waitForTimeout(ms);
 }
 
+async function resolveActionScope(scope, { requireDocumentList = false } = {}) {
+  const page = getScopePage(scope);
+  const candidates = [];
+  const addCandidate = (candidate) => {
+    if (candidate && !candidates.includes(candidate)) candidates.push(candidate);
+  };
+
+  addCandidate(scope);
+  addCandidate(page.mainFrame());
+  for (const frame of page.frames()) addCandidate(frame);
+
+  for (const candidate of candidates) {
+    const documentListCount = await candidate
+      .locator("#document_list")
+      .count()
+      .catch(() => 0);
+    const checkboxCount = await candidate
+      .locator('#document_list input[type="checkbox"]')
+      .count()
+      .catch(() => 0);
+
+    if (requireDocumentList) {
+      if (documentListCount > 0 || checkboxCount > 0) return candidate;
+      continue;
+    }
+
+    const actionButtonCount = await candidate
+      .locator(
+        "a#action_selectmode, button#action_selectmode, a#action_changefolder, button#action_changefolder"
+      )
+      .count()
+      .catch(() => 0);
+    const actionTextCount = await candidate
+      .locator("text=/^Select Mode$/i, text=/^Change Folder$/i")
+      .count()
+      .catch(() => 0);
+    const folderSelectionCount = await candidate
+      .locator("#folderselection")
+      .count()
+      .catch(() => 0);
+
+    if (
+      documentListCount > 0 ||
+      checkboxCount > 0 ||
+      actionButtonCount > 0 ||
+      actionTextCount > 0 ||
+      folderSelectionCount > 0
+    ) {
+      return candidate;
+    }
+  }
+
+  return scope;
+}
+
 /* ---------------- folder helpers ---------------- */
 
 async function promptUntilFolderLoads(scope, promptMsg) {
@@ -156,7 +224,8 @@ async function promptUntilFolderLoads(scope, promptMsg) {
   }
 }
 
-async function promptUntilFolderExists(scope, promptMsg) {
+async function promptUntilFolderExists(scope, promptMsg, options = {}) {
+  const { nonDisruptive = false } = options;
   while (true) {
     const name = await promptText(promptMsg);
 
@@ -165,7 +234,9 @@ async function promptUntilFolderExists(scope, promptMsg) {
       return null;
     }
 
-    const found = await findFolderLink(scope, name);
+    const found = await findFolderLinkWithOptions(scope, name, {
+      prepare: !nonDisruptive,
+    });
     if (found) return name;
 
     console.log(`❌ Folder "${name}" not found.`);
@@ -184,7 +255,15 @@ async function loadFilingScreen(scope) {
 
 // Finds folder by scrolling INSIDE the folder pane until found or end.
 async function findFolderLink(scope, folderName) {
-  await withTimeout(loadFilingScreen(scope), 10000, "Filing screen not ready");
+  return await findFolderLinkWithOptions(scope, folderName, { prepare: true });
+}
+
+async function findFolderLinkWithOptions(scope, folderName, options = {}) {
+  const { prepare = true } = options;
+
+  if (prepare) {
+    await withTimeout(loadFilingScreen(scope), 10000, "Filing screen not ready");
+  }
 
   const tree = scope.locator("#folders_list, #folders").first();
   await tree.waitFor({ state: "attached", timeout: 20000 });
@@ -331,7 +410,7 @@ async function loadFilingFolderOnce(scope, folderName) {
   console.log(`➡ Opening folder: "${folderName}"`);
   await loadFilingScreen(scope);
 
-  const link = await findFolderLink(scope, folderName);
+  const link = await findFolderLinkWithOptions(scope, folderName, { prepare: true });
   if (!link) {
     throw new Error(`Could not load folder "${folderName}" (not found in folder pane)`);
   }
@@ -355,24 +434,101 @@ async function loadFilingFolderOnce(scope, folderName) {
 /* ---------------- move helpers ---------------- */
 
 async function ensureSelectMode(scope) {
-  if ((await scope.locator('#document_list input[type="checkbox"]').count()) > 0) return;
+  scope = await resolveActionScope(scope, { requireDocumentList: true });
+
+  if ((await scope.locator("#document_list").count().catch(() => 0)) === 0) {
+    await scope.waitForSelector("#document_list", { timeout: 4000 }).catch(() => {});
+  }
+
+  if ((await scope.locator("#document_list").count().catch(() => 0)) === 0) {
+    await saveMoveDebugArtifacts(scope, "document-list-not-found-before-select-mode");
+    throw new Error(
+      "Document list not found while enabling Select Mode. " +
+        "Debug files: clean-move-debug-document-list-not-found-before-select-mode.json/png"
+    );
+  }
+
+  if (await isSelectModeEnabled(scope)) return;
 
   const docList = scope.locator("#document_list").first();
-  await docList.waitFor({ timeout: 60000 });
+  await docList.waitFor({ state: "attached", timeout: 5000 });
 
-  const menu = docList.locator("button").last();
-  await menu.click({ timeout: 60000 });
+  // Strategy 1: direct select mode action button/link.
+  const directSelect = scope.locator("a#action_selectmode, button#action_selectmode").first();
+  if ((await directSelect.count().catch(() => 0)) > 0) {
+    await directSelect.click({ timeout: 5000 }).catch(() => {});
+  }
+  if (await isSelectModeEnabled(scope)) return;
 
-  const selectMode = scope.locator("text=/^Select Mode$/i").first();
-  await selectMode.waitFor({ timeout: 60000 });
-  await selectMode.click({ timeout: 60000 });
+  // Strategy 2: visible "Select Mode" action.
+  const selectModeText = scope.locator("text=/^Select Mode$/i").first();
+  const selectModeVisible = await selectModeText.isVisible({ timeout: 500 }).catch(() => false);
+  if (selectModeVisible) {
+    await selectModeText.click({ timeout: 5000 }).catch(() => {});
+  }
+  if (await isSelectModeEnabled(scope)) return;
 
-  await scope.waitForSelector('#document_list input[type="checkbox"]', {
-    timeout: 60000,
-  });
+  // Strategy 2b: open document list overflow ("...") then choose select mode.
+  const menuOpened = await openDocumentListOverflowMenu(scope);
+  if (menuOpened) {
+    const clicked = await tryEnableSelectModeFromMenu(scope);
+    if (clicked) {
+      await waitForTimeout(scope, 400);
+      if (await isSelectModeEnabled(scope)) return;
+      console.log(
+        "⚠ Select Mode checkbox/action was clicked. Continuing (checked state not detectable in DOM)."
+      );
+      return;
+    }
+  }
+  if (await isSelectModeEnabled(scope)) return;
+
+  // Strategy 3: open common menu candidates then click "Select Mode".
+  const menuCandidates = [
+    "#document_list button",
+    '#document_list [role="button"]',
+    '#document_list a[aria-haspopup="true"]',
+    "#document_list .dropdown-toggle",
+    "#document_list .btn",
+  ];
+
+  for (const selector of menuCandidates) {
+    const candidates = scope.locator(selector);
+    const count = Math.min(await candidates.count().catch(() => 0), 6);
+    for (let i = 0; i < count; i++) {
+      const menu = candidates.nth(i);
+      const visible = await menu.isVisible({ timeout: 200 }).catch(() => false);
+      if (!visible) continue;
+
+      await menu.click().catch(() => {});
+      const selectMode = scope.locator("text=/^Select Mode$/i").first();
+      const visibleSelect = await selectMode.isVisible({ timeout: 500 }).catch(() => false);
+      if (visibleSelect) {
+        const clicked = await selectMode.click({ timeout: 5000 }).then(() => true).catch(() => false);
+        if (clicked) {
+          await waitForTimeout(scope, 120);
+          if (await isSelectModeEnabled(scope)) return;
+          console.log(
+            "⚠ Select Mode action clicked from menu candidate. Continuing without checkbox-state confirmation."
+          );
+          return;
+        }
+      }
+
+      if (await isSelectModeEnabled(scope)) return;
+    }
+  }
+
+  await saveMoveDebugArtifacts(scope, "select-mode-not-available");
+  throw new Error(
+    "Could not enable Select Mode in Document List. " +
+      "Debug files: clean-move-debug-select-mode-not-available.json/png"
+  );
 }
 
 async function selectDocumentsByTitle(scope, titles) {
+  scope = await resolveActionScope(scope, { requireDocumentList: true });
+
   const items = await scope.$$("#document_list li");
   let selected = 0;
 
@@ -384,11 +540,23 @@ async function selectDocumentsByTitle(scope, titles) {
     if (!titles.includes(title)) continue;
 
     const checkbox = await item.$('input[type="checkbox"]');
-    if (checkbox && !(await checkbox.isChecked())) {
-      await checkbox.click();
+    if (checkbox) {
+      if (!(await checkbox.isChecked())) {
+        await checkbox.click();
+      }
       selected++;
       await waitForTimeout(scope, 10);
+      continue;
     }
+
+    // Some Docman variants use row-click selection in Select Mode (no per-row checkbox).
+    const rowClickable =
+      (await item.$("a")) ||
+      (await item.$("div")) ||
+      item;
+    await rowClickable.click().catch(() => {});
+    selected++;
+    await waitForTimeout(scope, 20);
   }
 
   if (!selected) {
@@ -397,20 +565,75 @@ async function selectDocumentsByTitle(scope, titles) {
 }
 
 async function openChangeFolder(scope) {
-  const byId = scope.locator("a#action_changefolder").first();
-  if ((await byId.count().catch(() => 0)) > 0) {
-    await byId.click({ timeout: 60000 });
-  } else {
-    await scope.locator("text=/^Change Folder$/i").first().click({ timeout: 60000 });
+  scope = await resolveActionScope(scope);
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    await dismissTransientBlockingModals(scope, "before opening change folder");
+
+    const byId = scope.locator("a#action_changefolder").first();
+    const byIdVisible = await byId.isVisible({ timeout: 300 }).catch(() => false);
+    if (byIdVisible || (await byId.count().catch(() => 0)) > 0) {
+      await byId.click({ timeout: 60000 }).catch(() => {});
+    } else if (
+      await scope
+        .locator("text=/^Change Folder$/i")
+        .first()
+        .isVisible({ timeout: 400 })
+        .catch(() => false)
+    ) {
+      await scope
+        .locator("text=/^Change Folder$/i")
+        .first()
+        .click({ timeout: 60000 })
+        .catch(() => {});
+    } else {
+      const menuOpened = await openDocumentListOverflowMenu(scope);
+      if (menuOpened) {
+        const clicked = await tryClickAnyAction(scope, [
+          /^Change Folder$/i,
+          /^Move to Folder$/i,
+          /^Move Folder$/i,
+        ]);
+        if (!clicked && attempt === 2) {
+          throw new Error('Could not find "Change Folder" action in document menu.');
+        }
+      } else if (attempt === 2) {
+        throw new Error('Could not open document list menu for "Change Folder".');
+      }
+    }
+
+    const dialogVisible = await Promise.any([
+      scope
+        .locator("text=/^Change Document Folder$/i")
+        .first()
+        .waitFor({ timeout: 4000 })
+        .then(() => true),
+      scope
+        .locator("#folderselection")
+        .first()
+        .waitFor({ timeout: 4000 })
+        .then(() => true),
+      scope
+        .locator("input#change_folder_confirm")
+        .first()
+        .waitFor({ timeout: 4000 })
+        .then(() => true),
+    ]).catch(() => false);
+
+    if (dialogVisible) return;
+    await dismissTransientBlockingModals(scope, "change folder dialog did not appear");
   }
 
-  await scope
-    .locator("text=/^Change Document Folder$/i")
-    .first()
-    .waitFor({ timeout: 60000 });
+  await saveMoveDebugArtifacts(scope, "change-folder-dialog-not-visible");
+  throw new Error(
+    "Change Folder dialog did not appear. " +
+      "Debug files: clean-move-debug-change-folder-dialog-not-visible.json/png"
+  );
 }
 
 async function moveToFolder(scope, folderName) {
+  scope = await resolveActionScope(scope);
+  await dismissTransientBlockingModals(scope, "before destination selection");
+
   const targetByDataName = scope
     .locator(
       `xpath=//ul[@id="folderselection"]//a[@data-name=${toXPathLiteral(
@@ -422,7 +645,18 @@ async function moveToFolder(scope, folderName) {
     .locator(`xpath=//*[normalize-space(text())=${toXPathLiteral(folderName)}]`)
     .first();
 
-  if ((await targetByDataName.count().catch(() => 0)) > 0) {
+  const hasDataTarget = (await targetByDataName.count().catch(() => 0)) > 0;
+  const hasFallbackTarget = (await targetFallback.count().catch(() => 0)) > 0;
+
+  if (!hasDataTarget && !hasFallbackTarget) {
+    await saveMoveDebugArtifacts(scope, "destination-folder-not-visible");
+    throw new Error(
+      `Destination folder "${folderName}" not visible in change-folder dialog. ` +
+        "Debug files: clean-move-debug-destination-folder-not-visible.json/png"
+    );
+  }
+
+  if (hasDataTarget) {
     await targetByDataName.click({ timeout: 60000 });
   } else {
     await targetFallback.waitFor({ timeout: 60000 });
@@ -433,8 +667,262 @@ async function moveToFolder(scope, folderName) {
   if ((await confirmById.count().catch(() => 0)) > 0) {
     await confirmById.click({ timeout: 60000 });
   } else {
-    await scope.locator('button:has-text("Confirm")').first().click({ timeout: 60000 });
+    await scope
+      .locator('button:has-text("Confirm"), button:has-text("Move"), input[value="Confirm"]')
+      .first()
+      .click({ timeout: 60000 });
   }
+
+  await dismissTransientBlockingModals(scope, "after destination confirm");
+}
+
+async function openDocumentListOverflowMenu(scope) {
+  const candidates = [
+    '#document_list_header button:has-text("...")',
+    '#document_list_header [role="button"]:has-text("...")',
+    '#document_list_header button:has-text("…")',
+    '#document_list_header [role="button"]:has-text("…")',
+    '#document_list_header button:has-text("⋯")',
+    '#document_list_header [role="button"]:has-text("⋯")',
+    '#document_list button:has-text("...")',
+    '#document_list [role="button"]:has-text("...")',
+    '#document_list button:has-text("…")',
+    '#document_list [role="button"]:has-text("…")',
+    '#document_list button:has-text("⋯")',
+    '#document_list [role="button"]:has-text("⋯")',
+    'button:has-text("...")',
+    '[role="button"]:has-text("...")',
+    'button:has-text("…")',
+    '[role="button"]:has-text("…")',
+    'button:has-text("⋯")',
+    '[role="button"]:has-text("⋯")',
+    '[aria-label*="more" i]',
+    '[aria-label*="menu" i]',
+    '[title*="more" i]',
+    '[title*="menu" i]',
+    '[class*="ellipsis" i]',
+    '[class*="kebab" i]',
+    '[class*="more" i]',
+  ];
+
+  for (const selector of candidates) {
+    const loc = scope.locator(selector);
+    const count = Math.min(await loc.count().catch(() => 0), 8);
+    for (let i = 0; i < count; i++) {
+      const item = loc.nth(i);
+      const visible = await item.isVisible({ timeout: 200 }).catch(() => false);
+      if (!visible) continue;
+      await item.click().catch(() => {});
+      await waitForTimeout(scope, 180);
+      return true;
+    }
+  }
+
+  return false;
+}
+
+async function tryClickAnyAction(scope, regexList) {
+  for (const regex of regexList) {
+    const candidate = scope.getByText(regex).first();
+    const visible = await candidate.isVisible({ timeout: 300 }).catch(() => false);
+    if (!visible) continue;
+    try {
+      await candidate.click({ timeout: 5000 });
+      return true;
+    } catch (_) {
+      continue;
+    }
+  }
+  return false;
+}
+
+async function tryEnableSelectModeFromMenu(scope) {
+  const checkboxCandidates = [
+    'label:has-text("Select Mode") input[type="checkbox"]',
+    'li:has-text("Select Mode") input[type="checkbox"]',
+    'div:has-text("Select Mode") input[type="checkbox"]',
+    '[role="menuitemcheckbox"]:has-text("Select Mode") input[type="checkbox"]',
+  ];
+
+  for (const selector of checkboxCandidates) {
+    const cb = scope.locator(selector).first();
+    const exists = (await cb.count().catch(() => 0)) > 0;
+    if (!exists) continue;
+
+    const checked = await cb.isChecked().catch(() => false);
+    if (!checked) {
+      await cb.click({ timeout: 5000, force: true }).catch(() => {});
+      await waitForTimeout(scope, 120);
+
+      const checkedAfterClick = await cb.isChecked().catch(() => false);
+      if (!checkedAfterClick) {
+        await cb.press("Space").catch(() => {});
+      }
+    }
+    if (await isSelectModeEnabled(scope)) return true;
+  }
+
+  // Some tenants require clicking the menu row left-edge where the checkbox is rendered.
+  const rowClick = await clickSelectModeRowCheckboxArea(scope);
+  if (rowClick) {
+    await waitForTimeout(scope, 150);
+    if (await isSelectModeEnabled(scope)) return true;
+    return true;
+  }
+
+  const clicked = await tryClickAnyAction(scope, [
+    /^Select Mode$/i,
+    /^Select Documents?$/i,
+    /^Multi[- ]?select$/i,
+    /^Select$/i,
+  ]);
+  if (!clicked) return false;
+
+  await waitForTimeout(scope, 120);
+  if (await isSelectModeEnabled(scope)) return true;
+
+  // Last fallback: if we successfully clicked a Select Mode action but this tenant does
+  // not expose checked-state/checkboxes in DOM, continue optimistically.
+  return true;
+}
+
+async function isSelectModeEnabled(scope) {
+  const rowCheckboxCount = await scope
+    .locator('#document_list input[type="checkbox"]')
+    .count()
+    .catch(() => 0);
+  if (rowCheckboxCount > 0) return true;
+
+  const menuCheckboxCandidates = [
+    'label:has-text("Select Mode") input[type="checkbox"]',
+    'li:has-text("Select Mode") input[type="checkbox"]',
+    'div:has-text("Select Mode") input[type="checkbox"]',
+    '[role="menuitemcheckbox"]:has-text("Select Mode") input[type="checkbox"]',
+  ];
+
+  for (const selector of menuCheckboxCandidates) {
+    const cb = scope.locator(selector).first();
+    const count = await cb.count().catch(() => 0);
+    if (!count) continue;
+    const checked = await cb.isChecked().catch(() => false);
+    if (checked) return true;
+  }
+
+  const menuAriaChecked = await scope
+    .locator(
+      [
+        '[role="menuitemcheckbox"][aria-checked="true"]:has-text("Select Mode")',
+        '[aria-checked="true"]:has-text("Select Mode")',
+      ].join(", ")
+    )
+    .count()
+    .catch(() => 0);
+  if (menuAriaChecked > 0) return true;
+
+  const activeSelectMode = await scope
+    .locator(
+      [
+        '[class*="select" i][class*="active" i]:has-text("Select Mode")',
+        '[class*="active" i]:has-text("Select Mode")',
+      ].join(", ")
+    )
+    .count()
+    .catch(() => 0);
+
+  return activeSelectMode > 0;
+}
+
+async function dismissTransientBlockingModals(scope, reason = "unknown") {
+  const page = getScopePage(scope);
+  const deadline = Date.now() + 2500;
+  let dismissedAny = false;
+
+  while (Date.now() < deadline) {
+    const ajaxTitle = page.locator("text=/AJAX Issue/i").first();
+    const ajaxVisible = await ajaxTitle.isVisible({ timeout: 120 }).catch(() => false);
+
+    const genericModal = page
+      .locator(
+        [
+          '.modal:visible',
+          '.bootbox:visible',
+          '.alertify.ajs-in',
+          '[role="dialog"]:visible',
+        ].join(", ")
+      )
+      .first();
+    const genericVisible = await genericModal.isVisible({ timeout: 120 }).catch(() => false);
+
+    if (!ajaxVisible && !genericVisible) break;
+
+    const okBtn = page
+      .locator(
+        [
+          'button:has-text("Ok")',
+          'button:has-text("OK")',
+          'button:has-text("Close")',
+          'button:has-text("Confirm")',
+          'input[value="OK"]',
+          'input[value="Ok"]',
+        ].join(", ")
+      )
+      .first();
+
+    if ((await okBtn.count().catch(() => 0)) > 0) {
+      await okBtn.click({ force: true }).catch(() => {});
+      dismissedAny = true;
+    } else {
+      await page.keyboard.press("Escape").catch(() => {});
+      dismissedAny = true;
+    }
+
+    await page.waitForTimeout(150);
+  }
+
+  if (dismissedAny) {
+    console.log(`⚠ Dismissed blocking modal (${reason})`);
+  }
+}
+
+async function clickSelectModeRowCheckboxArea(scope) {
+  const page = getScopePage(scope);
+  const rowSelectors = [
+    '#document_list_header label:has-text("Select Mode")',
+    '#document_list_header [role="menuitemcheckbox"]:has-text("Select Mode")',
+    '#document_list_header li:has-text("Select Mode")',
+    '#document_list_header div:has-text("Select Mode")',
+    '#document_list label:has-text("Select Mode")',
+    '#document_list [role="menuitemcheckbox"]:has-text("Select Mode")',
+    '#document_list li:has-text("Select Mode")',
+    '#document_list div:has-text("Select Mode")',
+    'label:has-text("Select Mode")',
+    '[role="menuitemcheckbox"]:has-text("Select Mode")',
+    'li:has-text("Select Mode")',
+    'div:has-text("Select Mode")',
+  ];
+
+  for (const selector of rowSelectors) {
+    const rows = scope.locator(selector);
+    const count = Math.min(await rows.count().catch(() => 0), 8);
+    for (let i = 0; i < count; i++) {
+      const row = rows.nth(i);
+      const visible = await row.isVisible({ timeout: 200 }).catch(() => false);
+      if (!visible) continue;
+
+      const box = await row.boundingBox().catch(() => null);
+      if (box) {
+        const x = box.x + Math.min(14, Math.max(6, box.width * 0.12));
+        const y = box.y + Math.max(6, box.height / 2);
+        await page.mouse.click(x, y).catch(() => {});
+        await waitForTimeout(scope, 80);
+      }
+
+      await row.click({ timeout: 3000, force: true }).catch(() => {});
+      return true;
+    }
+  }
+
+  return false;
 }
 
 /* ---------------- misc helpers ---------------- */
@@ -528,6 +1016,72 @@ function sanitizeFileName(value) {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 60);
+}
+
+async function saveMoveDebugArtifacts(scope, reason) {
+  try {
+    const page = getScopePage(scope);
+    const tag = sanitizeFileName(reason || "move");
+    const jsonFile = `clean-move-debug-${tag}.json`;
+    const screenshotFile = `clean-move-debug-${tag}.png`;
+
+    const info = {
+      createdAt: new Date().toISOString(),
+      reason,
+      pageUrl: page.url(),
+      scopeType: scope === page ? "page" : "frame",
+      scopeUrl: typeof scope.url === "function" ? scope.url() : page.url(),
+      selectors: {
+        documentList: await scope.locator("#document_list").count().catch(() => 0),
+        checkboxes: await scope
+          .locator('#document_list input[type="checkbox"]')
+          .count()
+          .catch(() => 0),
+        actionSelectMode: await scope
+          .locator("a#action_selectmode, button#action_selectmode")
+          .count()
+          .catch(() => 0),
+        actionChangeFolder: await scope
+          .locator("a#action_changefolder, button#action_changefolder")
+          .count()
+          .catch(() => 0),
+      },
+      visibleMenuLabels: await scope
+        .locator("#document_list button, #document_list a")
+        .evaluateAll((nodes) => {
+          const labels = [];
+          for (const n of nodes) {
+            const text = (n.textContent || "").replace(/\s+/g, " ").trim();
+            if (!text) continue;
+            if (!labels.includes(text)) labels.push(text);
+            if (labels.length >= 100) break;
+          }
+          return labels;
+        })
+        .catch(() => []),
+      visibleActionTexts: await scope
+        .locator("label, a, button, li, div")
+        .evaluateAll((nodes) => {
+          const labels = [];
+          for (const n of nodes) {
+            const style = window.getComputedStyle(n);
+            if (!style || style.display === "none" || style.visibility === "hidden") {
+              continue;
+            }
+            const text = (n.textContent || "").replace(/\s+/g, " ").trim();
+            if (!text) continue;
+            if (text.length > 60) continue;
+            if (!labels.includes(text)) labels.push(text);
+            if (labels.length >= 200) break;
+          }
+          return labels;
+        })
+        .catch(() => []),
+    };
+
+    fs.writeFileSync(path.join(process.cwd(), jsonFile), JSON.stringify(info, null, 2), "utf8");
+    await page.screenshot({ path: screenshotFile, fullPage: true }).catch(() => {});
+  } catch (_) {}
 }
 
 function withTimeout(promise, ms, message) {

@@ -17,6 +17,8 @@ function findProjectRoot(startDir) {
 const PROJECT_ROOT = findProjectRoot(path.resolve(__dirname, ".."));
 const PROFILE_DIR = path.join(PROJECT_ROOT, ".browser-profile");
 const LOCK_FILE = path.join(PROFILE_DIR, "playwright-profile.lock");
+const WINDOW_WIDTH = 1920;
+const WINDOW_HEIGHT = 1080;
 
 let _sessionPromise = null;
 
@@ -51,6 +53,56 @@ function releaseLock() {
   } catch (_) {}
 }
 
+function patchJsonFile(filePath, patcher) {
+  try {
+    if (!fs.existsSync(filePath)) return false;
+    const raw = fs.readFileSync(filePath, "utf8");
+    if (!raw.trim()) return false;
+    const parsed = JSON.parse(raw);
+    const changed = patcher(parsed);
+    if (!changed) return false;
+    fs.writeFileSync(filePath, JSON.stringify(parsed), "utf8");
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function markChromiumProfileAsClean() {
+  const prefPath = path.join(PROFILE_DIR, "Default", "Preferences");
+  patchJsonFile(prefPath, (json) => {
+    let changed = false;
+    if (typeof json.exited_cleanly === "boolean" && json.exited_cleanly !== true) {
+      json.exited_cleanly = true;
+      changed = true;
+    }
+    if (typeof json.exit_type === "string" && json.exit_type.toLowerCase() !== "normal") {
+      json.exit_type = "Normal";
+      changed = true;
+    }
+    if (json.profile && typeof json.profile === "object") {
+      if (json.profile.exited_cleanly !== true) {
+        json.profile.exited_cleanly = true;
+        changed = true;
+      }
+      if (json.profile.exit_type !== "Normal") {
+        json.profile.exit_type = "Normal";
+        changed = true;
+      }
+    }
+    return changed;
+  });
+
+  const localStatePath = path.join(PROFILE_DIR, "Local State");
+  patchJsonFile(localStatePath, (json) => {
+    const stability = json?.user_experience_metrics?.stability;
+    if (!stability || typeof stability !== "object") return false;
+    if (stability.exited_cleanly === true) return false;
+    stability.exited_cleanly = true;
+    return true;
+  });
+}
+
 /**
  * @param {object} [options]
  * @param {{username:string,password:string}} [options.httpCredentials] - HTTP Basic Auth credentials
@@ -60,6 +112,7 @@ async function getBrowserSession(options = {}) {
 
   _sessionPromise = (async () => {
     acquireLock();
+    markChromiumProfileAsClean();
 
     console.log(`[browserSession] Using persistent profile: ${PROFILE_DIR}`);
     if (options.httpCredentials?.username) {
@@ -70,14 +123,17 @@ async function getBrowserSession(options = {}) {
 
     const context = await chromium.launchPersistentContext(PROFILE_DIR, {
       headless: false,
-      viewport: null,
+      viewport: { width: WINDOW_WIDTH, height: WINDOW_HEIGHT },
       httpCredentials: options.httpCredentials, // ✅ this is the fix for the popup
 
       args: [
-        "--start-maximized",
+        `--window-size=${WINDOW_WIDTH},${WINDOW_HEIGHT}`,
+        "--window-position=40,40",
         "--disable-blink-features=AutomationControlled",
         "--no-first-run",
         "--no-default-browser-check",
+        "--hide-crash-restore-bubble",
+        "--disable-session-crashed-bubble",
       ],
     });
 
