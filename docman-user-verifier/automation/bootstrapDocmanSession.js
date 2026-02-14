@@ -2,23 +2,44 @@
 const { getBrowserSession } = require("./browserSession");
 const { fetchDocmanCreds } = require("./fetchDocmanCreds");
 
+const BETTERLETTER_PRACTICES_URL = "https://app.betterletter.ai/admin_panel/practices";
+const DOCMAN_ORIGIN = "https://production.docman.thirdparty.nhs.uk";
+const DOCMAN_HOST_SUFFIX = "docman.thirdparty.nhs.uk";
+const DOCMAN_FILING_URL = `${DOCMAN_ORIGIN}/DocumentViewer/Filing`;
+const DOCMAN_LOGOUT_URL = `${DOCMAN_ORIGIN}/Account/Logout`;
+const DOCMAN_LOGIN_URL = `${DOCMAN_ORIGIN}/Account/Login`;
+
 async function bootstrapDocmanSession(practiceInput, sessionOptions = {}) {
+  const {
+    skipPostLoginDialogWatch = false,
+    forceFreshDocmanLogin = false,
+    resetDocmanAuthAtStart = true,
+    includeDocmanInHealthCheck = false,
+  } = sessionOptions;
   const { context, page } = await getBrowserSession(sessionOptions);
+
+  // Always start on BetterLetter admin panel when the browser opens.
+  await page.goto(BETTERLETTER_PRACTICES_URL, {
+    waitUntil: "domcontentloaded",
+    timeout: 60000,
+  }).catch(() => {});
+
+  const planLines = [
+    "1) Session health check",
+    "2) Login to BetterLetter (manual username/password/2FA if prompted)",
+    "3) Read Docman credentials from BetterLetter",
+    "4) Login to Docman with BetterLetter credentials",
+  ];
+  if (!skipPostLoginDialogWatch) {
+    planLines.push("5) Dismiss blocking dialogs");
+  }
 
   printPhaseBanner(
     "DOCMAN BOOTSTRAP",
-    [
-      "0) Enter/select target practice",
-      "1) Session health check",
-      "2) Login to BetterLetter (manual username/password/2FA if prompted)",
-      "3) Read Docman credentials from BetterLetter",
-      "4) Ensure Docman is logged into the correct practice",
-      "5) Dismiss blocking dialogs",
-    ]
+    planLines
   );
 
-  // 0) Resolve target practice.
-  printPhaseBanner("Step 0", ["Collect target practice"]);
+  // Practice is collected in run.js before browser launch.
   const practiceName =
     typeof practiceInput === "function"
       ? await practiceInput({ page })
@@ -28,9 +49,14 @@ async function bootstrapDocmanSession(practiceInput, sessionOptions = {}) {
     throw new Error("Practice name is required.");
   }
 
+  if (resetDocmanAuthAtStart) {
+    const removed = await clearDocmanAuthFromContext(context);
+    console.log(`🧹 Cleared Docman auth artifacts at startup (${removed} cookie(s) removed).`);
+  }
+
   // 1) Session health check (prints current auth status)
   printPhaseBanner("Step 1", ["Session health check"]);
-  await sessionHealthCheck(page);
+  await sessionHealthCheck(page, { includeDocmanCheck: includeDocmanInHealthCheck });
 
   // 2) BetterLetter (persistent session)
   printPhaseBanner("Step 2", ["Login to BetterLetter"]);
@@ -44,17 +70,22 @@ async function bootstrapDocmanSession(practiceInput, sessionOptions = {}) {
   );
 
   // 4) Ensure Docman is logged in and scoped to the target practice where possible.
-  printPhaseBanner("Step 4", ["Validate Docman session and log out/re-login if wrong practice"]);
+  printPhaseBanner("Step 4", ["Login to Docman with BetterLetter credentials"]);
   await ensureDocmanSessionForPractice(page, {
     practiceName: practiceName.trim(),
     odsCode,
     adminUsername,
     adminPassword,
+  }, {
+    forceFreshLogin: forceFreshDocmanLogin,
+    skipExistingSessionCheck: resetDocmanAuthAtStart,
   });
 
-  // 5) Clear any post-login modal(s)
-  printPhaseBanner("Step 5", ["Dismiss blocking dialogs"]);
-  await waitAndDismissBlockingDialogs(page, "after docman login");
+  // 5) Clear any post-login modal(s) when requested by workflow.
+  if (!skipPostLoginDialogWatch) {
+    printPhaseBanner("Step 5", ["Dismiss blocking dialogs"]);
+    await waitAndDismissBlockingDialogs(page, "after docman login");
+  }
 
   return {
     context,
@@ -67,10 +98,9 @@ async function bootstrapDocmanSession(practiceInput, sessionOptions = {}) {
 
 /* ------------ session health check ------------ */
 
-async function sessionHealthCheck(page) {
+async function sessionHealthCheck(page, options = {}) {
   console.log("\n================ SESSION HEALTH CHECK ================");
-
-  const returnUrl = page.url();
+  const includeDocmanCheck = Boolean(options.includeDocmanCheck);
 
   // ---------------- BetterLetter check ----------------
   let blLoggedIn = false;
@@ -106,42 +136,43 @@ async function sessionHealthCheck(page) {
   console.log(`BetterLetter: ${blLoggedIn ? "✅ Logged in" : "❌ Not logged in"}`);
 
 
-  // ---------------- Docman check ----------------
-  let dmLoggedIn = false;
-  try {
-    const filingUrl = "https://production.docman.thirdparty.nhs.uk/DocumentViewer/Filing";
-    const resp = await page.goto(filingUrl, {
-      waitUntil: "domcontentloaded",
-      timeout: 45000,
-    });
-
-    // Give redirects a moment
-    await page.waitForTimeout(300);
-
-    const authSurface = await inspectDocmanAuthSurface(page, 6000);
-    const onLoginPage = authSurface.onLoginPage;
-
-    dmLoggedIn = !onLoginPage;
-
-    console.log(
-      `Docman debug: status=${resp?.status?.() ?? "n/a"} url=${authSurface.url} onLoginPage=${onLoginPage}`
-    );
-  } catch (e) {
-    console.log("Docman: ⚠ Unable to determine (navigation issue)");
-  }
-
-  console.log(`Docman: ${dmLoggedIn ? "✅ Logged in" : "❌ Not logged in"}`);
-
-  console.log("======================================================\n");
-
-  // Restore the prior page (best effort)
-  try {
-    if (returnUrl && returnUrl !== "about:blank") {
-      await page.goto(returnUrl, {
+  if (includeDocmanCheck) {
+    // ---------------- Docman check ----------------
+    let dmLoggedIn = false;
+    try {
+      const resp = await page.goto(DOCMAN_FILING_URL, {
         waitUntil: "domcontentloaded",
         timeout: 45000,
       });
+
+      // Give redirects a moment
+      await page.waitForTimeout(300);
+
+      const authSurface = await inspectDocmanAuthSurface(page, 6000);
+      const onLoginPage = authSurface.onLoginPage;
+
+      dmLoggedIn = !onLoginPage;
+
+      console.log(
+        `Docman debug: status=${resp?.status?.() ?? "n/a"} url=${authSurface.url} onLoginPage=${onLoginPage}`
+      );
+    } catch (e) {
+      console.log("Docman: ⚠ Unable to determine (navigation issue)");
     }
+
+    console.log(`Docman: ${dmLoggedIn ? "✅ Logged in" : "❌ Not logged in"}`);
+  } else {
+    console.log("Docman: ⏭ Skipped in health check (keeping BetterLetter page focused).");
+  }
+
+  console.log("======================================================\n");
+
+  // Keep BetterLetter page in focus after health-check.
+  try {
+    await page.goto(BETTERLETTER_PRACTICES_URL, {
+      waitUntil: "domcontentloaded",
+      timeout: 45000,
+    });
   } catch (_) {}
 }
 
@@ -149,7 +180,7 @@ async function sessionHealthCheck(page) {
 /* ------------ BetterLetter helpers ------------ */
 
 async function ensureBetterLetterLoggedIn(page) {
-  await page.goto("https://app.betterletter.ai/admin_panel/practices", {
+  await page.goto(BETTERLETTER_PRACTICES_URL, {
     waitUntil: "domcontentloaded",
     timeout: 60000,
   });
@@ -177,7 +208,7 @@ async function ensureBetterLetterLoggedIn(page) {
     await waitForEnter();
 
     // After manual login, re-open practices
-    await page.goto("https://app.betterletter.ai/admin_panel/practices", {
+    await page.goto(BETTERLETTER_PRACTICES_URL, {
       waitUntil: "domcontentloaded",
       timeout: 60000,
     });
@@ -205,15 +236,12 @@ async function ensureBetterLetterLoggedIn(page) {
 /* ------------ Docman helpers ------------ */
 
 async function ensureDocmanLoggedIn(page, { odsCode, adminUsername, adminPassword }) {
-  const filingUrl =
-    "https://production.docman.thirdparty.nhs.uk/DocumentViewer/Filing";
-
   console.log("➡ Checking Docman session (attempting Filing directly)...");
-  const resp = await page.goto(filingUrl, {
+  const resp = await page.goto(DOCMAN_FILING_URL, {
     waitUntil: "domcontentloaded",
     timeout: 60000,
   });
-  await page.waitForTimeout(500);
+  await page.waitForTimeout(150);
 
   const authState = await inspectDocmanAuthSurface(page, 8000);
   const onLoginPage = authState.onLoginPage;
@@ -244,17 +272,29 @@ async function ensureDocmanLoggedIn(page, { odsCode, adminUsername, adminPasswor
   // Click submit
   const submit = page.locator('button[type="submit"], button:has-text("Sign In")').first();
   await submit.waitFor({ timeout: 30000 });
-  await Promise.allSettled([
-    submit.click(),
-    page.waitForLoadState("domcontentloaded", { timeout: 30000 }),
-    page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 30000 }),
+  await submit.click({ timeout: 30000 });
+
+  // Fast settle after submit: do not block on multiple long waits.
+  await Promise.race([
+    page.waitForURL(
+      (url) => {
+        const u = String(url).toLowerCase();
+        return !u.includes("/account/login") && !u.includes("/account/prelogin");
+      },
+      { timeout: 10000 }
+    ).catch(() => null),
+    page.waitForLoadState("domcontentloaded", { timeout: 6000 }).catch(() => null),
+    page.waitForTimeout(1200),
   ]);
 
-  // After submit, Docman may land somewhere else; ensure Filing is loaded
-  await page.goto(filingUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+  // Fast-path verification first on current page.
+  let postLoginState = await inspectDocmanAuthSurface(page, 3500);
 
-  // Final verification: if still on login/auth hand-off page, fail clearly.
-  const postLoginState = await inspectDocmanAuthSurface(page, 12000);
+  // If still on login/auth hand-off, force Filing and do a deeper check.
+  if (postLoginState.onLoginPage) {
+    await page.goto(DOCMAN_FILING_URL, { waitUntil: "commit", timeout: 60000 });
+    postLoginState = await inspectDocmanAuthSurface(page, 9000);
+  }
   const stillLogin = postLoginState.onLoginPage;
 
   if (stillLogin) {
@@ -275,7 +315,34 @@ async function ensureDocmanSessionForPractice(page, {
   odsCode,
   adminUsername,
   adminPassword,
-}) {
+}, options = {}) {
+  const {
+    forceFreshLogin = false,
+    skipExistingSessionCheck = false,
+  } = options;
+
+  if (forceFreshLogin) {
+    console.log("↻ Forcing fresh Docman login (clearing any existing Docman session first).");
+    await logoutDocman(page);
+    await ensureDocmanLoggedIn(page, { odsCode, adminUsername, adminPassword });
+
+    const post = await getDocmanAuthState(page);
+    if (!post.loggedIn) {
+      throw new Error("Docman login failed after forcing a fresh session.");
+    }
+    if (post.orgName && !practiceMatches(practiceName, post.orgName)) {
+      throw new Error(
+        `Docman logged in, but organisation is "${post.orgName}" (expected "${practiceName}").`
+      );
+    }
+    return;
+  }
+
+  if (skipExistingSessionCheck) {
+    await ensureDocmanLoggedIn(page, { odsCode, adminUsername, adminPassword });
+    return;
+  }
+
   const state = await getDocmanAuthState(page);
 
   if (!state.loggedIn) {
@@ -312,6 +379,69 @@ async function ensureDocmanSessionForPractice(page, {
   }
 }
 
+async function clearDocmanAuthFromContext(context) {
+  const docmanUrls = [
+    `${DOCMAN_ORIGIN}/`,
+    DOCMAN_LOGIN_URL,
+    DOCMAN_FILING_URL,
+  ];
+
+  let removedCount = 0;
+
+  try {
+    // Server-side session reset without changing the visible page.
+    await context.request.get(DOCMAN_LOGOUT_URL, {
+      timeout: 15000,
+      failOnStatusCode: false,
+    }).catch(() => {});
+
+    const docmanCookies = await context.cookies(docmanUrls);
+    if (!docmanCookies.length) return 0;
+
+    const expiryCookies = docmanCookies
+      .filter((cookie) => {
+        const domain = String(cookie.domain || "").replace(/^\./, "").toLowerCase();
+        return domain.endsWith(DOCMAN_HOST_SUFFIX);
+      })
+      .map((cookie) => {
+        const expired = {
+          name: cookie.name,
+          value: "",
+          domain: cookie.domain,
+          path: cookie.path || "/",
+          expires: 0,
+          httpOnly: Boolean(cookie.httpOnly),
+          secure: Boolean(cookie.secure),
+        };
+
+        if (
+          cookie.sameSite === "Lax" ||
+          cookie.sameSite === "Strict" ||
+          cookie.sameSite === "None"
+        ) {
+          expired.sameSite = cookie.sameSite;
+        }
+
+        return expired;
+      });
+
+    removedCount = expiryCookies.length;
+    if (expiryCookies.length) {
+      await context.addCookies(expiryCookies).catch(() => {});
+    }
+
+    // Final best-effort logout after cookie expiry.
+    await context.request.get(DOCMAN_LOGOUT_URL, {
+      timeout: 15000,
+      failOnStatusCode: false,
+    }).catch(() => {});
+
+    return removedCount;
+  } catch (_) {
+    return removedCount;
+  }
+}
+
 async function overwriteInput(locator, value, label = "field") {
   await locator.click({ clickCount: 3 }).catch(() => {});
   await locator.press("ControlOrMeta+A").catch(() => {});
@@ -331,8 +461,7 @@ async function overwriteInput(locator, value, label = "field") {
 }
 
 async function getDocmanAuthState(page) {
-  const filingUrl = "https://production.docman.thirdparty.nhs.uk/DocumentViewer/Filing";
-  await page.goto(filingUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+  await page.goto(DOCMAN_FILING_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
   await page.waitForTimeout(300);
   const authSurface = await inspectDocmanAuthSurface(page, 8000);
   const loggedIn = !authSurface.onLoginPage;
@@ -461,7 +590,7 @@ function practiceMatches(expectedPracticeName, docmanOrgName) {
 async function logoutDocman(page) {
   // Best-effort sign out. Many Docman deployments support /Account/Logout.
   // Even if it doesn't, we still handle the result safely.
-  await page.goto("https://production.docman.thirdparty.nhs.uk/Account/Logout", {
+  await page.goto(DOCMAN_LOGOUT_URL, {
     waitUntil: "domcontentloaded",
     timeout: 60000,
   }).catch(() => {});
@@ -479,11 +608,11 @@ async function logoutDocman(page) {
 }
 
 
-async function gotoDocmanFilingAndActivate(page) {
-  const docmanOrigin = "https://production.docman.thirdparty.nhs.uk";
+async function gotoDocmanFilingAndActivate(page, options = {}) {
+  const { skipDialogCheck = false } = options;
 
   console.log("➡ Navigating to Filing");
-  await page.goto(`${docmanOrigin}/DocumentViewer/Filing`, {
+  await page.goto(DOCMAN_FILING_URL, {
     waitUntil: "domcontentloaded",
     timeout: 60000,
   });
@@ -503,7 +632,9 @@ async function gotoDocmanFilingAndActivate(page) {
   // Close "Restore pages?" popup if it blocks clicks (best-effort)
   await dismissRestorePagesPopup(page);
 
-  await waitAndDismissBlockingDialogs(page, "after filing navigation");
+  if (!skipDialogCheck) {
+    await waitAndDismissBlockingDialogs(page, "after filing navigation");
+  }
 
   // Filing UI might be in an iframe — pick the best frame
   const frame = await getDocmanFilingFrame(page);

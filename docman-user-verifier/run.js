@@ -8,46 +8,66 @@ const cleanBetterLetterProcessing = require("./cleanBetterLetterProcessing");
 
 (async () => {
   let session = null;
+  let sessionCloseMessage = "Session finished. Browser will stay open.";
 
   try {
-    console.log("Using basic auth user:", "mailroom_admin");
-
-    console.log("🔗 Bootstrapping BetterLetter → Docman session…");
-
-    // ✅ HTTP Basic Auth hardcoded here (browser popup layer)
-    session = await bootstrapDocmanSession(async () => {
-      const { practiceName } = await inquirer.prompt([
-        {
-          type: "input",
-          name: "practiceName",
-          message: "Enter Practice Name (as shown in BetterLetter):",
-        },
-      ]);
-
-      return practiceName;
-    }, {
-      httpCredentials: {
-        username: "mailroom_admin",
-        password: "Yxbq95wbYhp0sAbR8xmV",
+    printPhaseBanner("Step 0", ["Collect target practice"]);
+    const { practiceName } = await inquirer.prompt([
+      {
+        type: "input",
+        name: "practiceName",
+        message: "Enter Practice Name (as shown in BetterLetter):",
       },
-    });
+    ]);
 
-    const { page } = session;
+    if (!practiceName?.trim()) {
+      console.log("Cancelled.");
+      return;
+    }
 
-    const { mode } = await inquirer.prompt([
+    const { mode: modeInput } = await inquirer.prompt([
       {
         type: "list",
         name: "mode",
         message: "What would you like to do?",
-        default: "verify",
+        default: "login",
         choices: [
+          { name: "Just login to Docman (no task)", value: "login" },
           { name: "Verify Docman users (copy valid names)", value: "verify" },
           { name: "Clean folder (move NON-UUID documents)", value: "clean" },
         ],
       },
     ]);
 
+    const mode = normalizeMode(modeInput);
+    if (!mode) {
+      console.log("Unknown mode selected:", modeInput);
+      return;
+    }
+
     console.log(`✅ Mode selected: ${mode}`);
+    console.log("Using basic auth user:", "mailroom_admin");
+
+    console.log("🔗 Bootstrapping BetterLetter → Docman session…");
+
+    // ✅ HTTP Basic Auth hardcoded here (browser popup layer)
+    session = await bootstrapDocmanSession(practiceName.trim(), {
+      httpCredentials: {
+        username: "mailroom_admin",
+        password: "Yxbq95wbYhp0sAbR8xmV",
+      },
+      forceFreshDocmanLogin: false,
+      resetDocmanAuthAtStart: true,
+      includeDocmanInHealthCheck: false,
+      skipPostLoginDialogWatch: mode === "login",
+    });
+
+    const { page } = session;
+
+    if (mode === "login") {
+      sessionCloseMessage = "Login Successful. Browser will stay open.";
+      return;
+    }
 
     if (mode === "clean") {
       const { confirmClean } = await inquirer.prompt([
@@ -67,7 +87,9 @@ const cleanBetterLetterProcessing = require("./cleanBetterLetterProcessing");
 
       if (typeof bootstrapDocmanSession.gotoDocmanFilingAndActivate === "function") {
         console.log("➡ Preparing Docman Filing for CLEAN workflow…");
-        await bootstrapDocmanSession.gotoDocmanFilingAndActivate(page);
+        await bootstrapDocmanSession.gotoDocmanFilingAndActivate(page, {
+          skipDialogCheck: true,
+        });
       }
 
       console.log("🧹 Starting CLEAN workflow…");
@@ -126,17 +148,51 @@ const cleanBetterLetterProcessing = require("./cleanBetterLetterProcessing");
       console.log("✅ VERIFY workflow finished.");
       return;
     }
-
-    console.log("Unknown mode selected:", mode);
   } catch (err) {
     console.error("\n❌ FAILED:", err?.message || err);
   } finally {
-    try {
-      if (session?.context) {
-        await session.context.close();
-      }
-    } catch (_) {}
-
-    process.stdin.pause();
+    if (session?.context) {
+      await waitForManualSessionEnd(session.context, sessionCloseMessage);
+    } else {
+      process.stdin.pause();
+    }
   }
 })();
+
+async function waitForManualSessionEnd(
+  context,
+  sessionMessage = "Session finished. Browser will stay open."
+) {
+  console.log(`\n${sessionMessage}`);
+  console.log("Close the browser window, or press ENTER here to close it and exit.");
+
+  await new Promise((resolve) => {
+    process.stdin.resume();
+    process.stdin.once("data", () => resolve());
+  });
+
+  try {
+    await context.close();
+  } catch (_) {}
+
+  process.stdin.pause();
+}
+
+function printPhaseBanner(title, lines = []) {
+  const width = 62;
+  const bar = "=".repeat(width);
+  console.log(`\n${bar}`);
+  console.log(` ${title}`);
+  for (const line of lines) {
+    console.log(` - ${line}`);
+  }
+  console.log(`${bar}\n`);
+}
+
+function normalizeMode(modeInput) {
+  const mode = String(modeInput || "").trim().toLowerCase();
+  if (mode === "login" || mode === "login_only") return "login";
+  if (mode === "clean") return "clean";
+  if (mode === "verify") return "verify";
+  return null;
+}
