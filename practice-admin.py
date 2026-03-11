@@ -731,6 +731,69 @@ class UnifiedToolApp:
         self._log_onboarding("ODS validation completed.")
         messagebox.showinfo("ODS Mismatch Check", final)
 
+    def _validate_current_creation(self, practice_name, ods, system_type):
+        folder_name = f"{practice_name.title()} ({ods})"
+        check_notes = []
+        check_passed = 0
+        check_issues = 0
+
+        for root_folder in self._root_folders:
+            if not os.path.isdir(root_folder):
+                check_notes.append(f"Skipped missing root folder: {root_folder}")
+                continue
+
+            root_label = os.path.basename(root_folder)
+            practice_file = os.path.join(root_folder, folder_name, "work-items.json")
+            if not os.path.exists(practice_file):
+                check_issues += 1
+                check_notes.append(f"[{root_label}] Missing practice file: {practice_file}")
+                continue
+
+            try:
+                with open(practice_file, "r", encoding="utf-8") as handle:
+                    practice_data = json.load(handle)
+                first_item = practice_data[0] if isinstance(practice_data, list) and practice_data else {}
+                file_ods = str(first_item.get("payload", {}).get("ods_code", "")).upper()
+            except Exception as exc:
+                check_issues += 1
+                check_notes.append(f"[{root_label}] Invalid practice JSON: {exc}")
+                continue
+
+            if file_ods == ods:
+                check_passed += 1
+            else:
+                check_issues += 1
+                check_notes.append(f"[{root_label}] ODS mismatch in practice file (found: {file_ods or '[None]'})")
+
+            if system_type != "Docman":
+                continue
+
+            count_path = os.path.join(root_folder, "Practice Count", "work-items.json")
+            if not os.path.exists(count_path):
+                check_issues += 1
+                check_notes.append(f"[{root_label}] Missing Practice Count file: {count_path}")
+                continue
+
+            try:
+                with open(count_path, "r", encoding="utf-8") as handle:
+                    count_data = json.load(handle)
+            except Exception as exc:
+                check_issues += 1
+                check_notes.append(f"[{root_label}] Invalid Practice Count JSON: {exc}")
+                continue
+
+            found = any(str(item.get("payload", {}).get("ods_code", "")).upper() == ods for item in count_data)
+            if found:
+                check_passed += 1
+            else:
+                check_issues += 1
+                check_notes.append(f"[{root_label}] ODS {ods} not found in Practice Count.")
+
+        if system_type != "Docman":
+            check_notes.append("Practice Count check skipped for EMIS mode.")
+
+        return check_passed, check_issues, check_notes
+
     def create_json_files(self):
         self._log_onboarding("Create Files clicked.")
         system_type = self.system_var.get().strip() or "Docman"
@@ -767,6 +830,7 @@ class UnifiedToolApp:
 
                 with open(practice_file, "w", encoding="utf-8") as handle:
                     json.dump([{"payload": {"ods_code": ods}}], handle, indent=4)
+                    handle.write("\n")
 
                 if system_type != "Docman":
                     notes.append(f"{root_folder}: skipped Practice Count update for EMIS mode")
@@ -795,6 +859,7 @@ class UnifiedToolApp:
                     os.makedirs(os.path.dirname(count_path), exist_ok=True)
                     with open(count_path, "w", encoding="utf-8") as handle:
                         json.dump(data, handle, indent=4)
+                        handle.write("\n")
                     counts_updated += 1
                 else:
                     notes.append(f"ODS {ods} already exists in Practice Count at {root_folder}")
@@ -814,11 +879,24 @@ class UnifiedToolApp:
             summary.append("Details:")
             summary.extend(notes)
 
+        checks_ok, checks_failed, check_notes = self._validate_current_creation(practice_name, ods, system_type)
+        summary.append("")
+        summary.append("Current Creation Check:")
+        if checks_failed == 0:
+            summary.append(f"Passed ({checks_ok} checks).")
+        else:
+            summary.append(f"Completed with {checks_failed} issue(s) ({checks_ok} checks passed).")
+        if check_notes:
+            summary.extend(check_notes)
+
         self._log_onboarding(
             f"Create completed for {practice_name} ({ods}). Folders: {folders_created}, Count updates: {counts_updated}"
         )
+        if checks_failed == 0:
+            self._log_onboarding(f"Current creation validation passed for ODS {ods}.")
+        else:
+            self._log_onboarding(f"Current creation validation found {checks_failed} issue(s) for ODS {ods}.")
         messagebox.showinfo("Status", "\n".join(summary))
-        self.run_validation_script()
 
     def offboard_practice(self):
         self._log_onboarding("Offboard clicked.")
@@ -847,6 +925,7 @@ class UnifiedToolApp:
                 if len(data) < original_len:
                     with open(count_path, "w", encoding="utf-8") as handle:
                         json.dump(data, handle, indent=4)
+                        handle.write("\n")
                     removed += 1
             except Exception as exc:
                 self._log_onboarding(f"Offboard failed updating {count_path}: {exc}")
