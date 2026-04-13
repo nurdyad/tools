@@ -34,48 +34,28 @@ async function verifyDocmanUsers({ page, usernames }) {
     );
   }
 
-  await waitForUserListReady(page);
-
-  const filter = page
-    .locator(
-      [
-        "#Filter_Criteria",
-        'input[name="Filter.Criteria"]',
-        'input[id*="Filter_Criteria"]',
-        'input[type="search"]',
-      ].join(", ")
-    )
-    .first();
-  await filter.waitFor({ timeout: 60000 });
+  const filter = await waitForUserListReady(page);
 
   const results = [];
 
   for (const username of usernames) {
     const exactCandidates = await runSearch(page, filter, username);
-    const exactMatch = findExactMatch(exactCandidates, username);
+    let exactMatch = findBestResolvedMatch(exactCandidates, username);
     const partialMatches = [];
 
     if (!exactMatch) {
-      const parts = username
-        .split(" ")
-        .map((p) => p.trim())
-        .filter((p) => p.length >= 3)
-        .slice(0, 2);
+      addRelevantPartialMatches(partialMatches, exactCandidates, username);
+      const searchTerms = buildFallbackSearchTerms(username);
 
-      for (const part of parts) {
+      for (const part of searchTerms) {
         const partCandidates = await runSearch(page, filter, part);
-        for (const candidate of partCandidates) {
-          const containsPart = candidate
-            .toLowerCase()
-            .includes(part.toLowerCase());
-          if (
-            containsPart &&
-            !partialMatches.includes(candidate) &&
-            !isSameUser(candidate, username)
-          ) {
-            partialMatches.push(candidate);
-          }
+        const resolvedFromPart = findBestResolvedMatch(partCandidates, username);
+        if (resolvedFromPart) {
+          exactMatch = resolvedFromPart;
+          break;
         }
+
+        addRelevantPartialMatches(partialMatches, partCandidates, username);
         if (partialMatches.length >= 5) break;
       }
     }
@@ -93,29 +73,29 @@ async function verifyDocmanUsers({ page, usernames }) {
 }
 
 async function waitForUserListReady(page) {
-  await page.waitForSelector("table tbody", { timeout: 60000 });
-  await page.waitForSelector(
-    [
-      "#Filter_Criteria",
-      'input[name="Filter.Criteria"]',
-      'input[id*="Filter_Criteria"]',
-      'input[type="search"]',
-    ].join(", "),
-    { timeout: 60000 }
-  );
+  await page.waitForSelector("table tbody, table", { timeout: 60000 });
+  return await waitForVisibleFilter(page, 60000);
 }
 
 async function runSearch(page, filter, term) {
+  const baselineSnapshot = await readUserListSnapshot(page);
+
   await filter.click({ timeout: 10000 }).catch(() => {});
-  await filter.fill("");
-  await filter.type(term, { delay: 20 });
+  await filter.fill("").catch(() => {});
+  await filter.type(term, { delay: 20 }).catch(async () => {
+    await filter.fill(term).catch(() => {});
+  });
+  await filter.evaluate((element) => {
+    element.dispatchEvent(new Event("input", { bubbles: true }));
+    element.dispatchEvent(new Event("change", { bubbles: true }));
+  }).catch(() => {});
 
   await Promise.allSettled([
     filter.press("Enter"),
-    page.waitForLoadState("domcontentloaded", { timeout: 1200 }),
+    page.waitForLoadState("networkidle", { timeout: 1200 }),
   ]);
 
-  await page.waitForTimeout(120);
+  await waitForResultsToSettle(page, filter, term, baselineSnapshot);
   return await readVisibleUsernames(page);
 }
 
@@ -206,19 +186,262 @@ async function inspectDocmanLoginState(page) {
   return { onLoginPage, url };
 }
 
-function findExactMatch(candidates, target) {
-  return candidates.find((candidate) => isSameUser(candidate, target)) || null;
+function findBestResolvedMatch(candidates, target) {
+  const exact = candidates.find((candidate) => isSameUser(candidate, target, { stripTitles: false }));
+  if (exact) return exact;
+
+  const normalizedMatches = candidates.filter((candidate) =>
+    isSameUser(candidate, target, { stripTitles: true })
+  );
+
+  return normalizedMatches.length === 1 ? normalizedMatches[0] : null;
 }
 
-function isSameUser(a, b) {
-  return normalizeName(a) === normalizeName(b);
+function isSameUser(a, b, options = {}) {
+  return normalizeName(a, options) === normalizeName(b, options);
 }
 
-function normalizeName(value) {
-  return (value || "")
+function normalizeName(value, options = {}) {
+  const stripTitles = options.stripTitles !== false;
+  let normalized = String(value || "")
     .trim()
     .toLowerCase()
+    .replace(/[^\w\s]/g, " ")
     .replace(/\s+/g, " ");
+
+  if (stripTitles) {
+    normalized = normalized.replace(/\b(mr|mrs|miss|ms|dr|prof|professor|sir|lady)\b/g, " ");
+  }
+
+  return normalized.replace(/\s+/g, " ").trim();
+}
+
+function buildFallbackSearchTerms(username) {
+  const raw = String(username || "").trim();
+  const stripped = normalizeName(raw, { stripTitles: true });
+  const terms = [];
+
+  if (stripped && stripped !== normalizeName(raw, { stripTitles: false })) {
+    terms.push(stripped);
+  }
+
+  const tokens = stripped
+    .split(" ")
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 3);
+
+  for (const token of tokens) {
+    if (!terms.includes(token)) terms.push(token);
+  }
+
+  if (tokens.length >= 2) {
+    const firstLast = `${tokens[0]} ${tokens[tokens.length - 1]}`.trim();
+    if (firstLast && !terms.includes(firstLast)) terms.push(firstLast);
+  }
+
+  return terms.slice(0, 5);
+}
+
+function addRelevantPartialMatches(partialMatches, candidates, username) {
+  for (const candidate of candidates) {
+    if (partialMatches.length >= 5) break;
+    if (partialMatches.includes(candidate)) continue;
+    if (isRelevantPartialMatch(candidate, username)) {
+      partialMatches.push(candidate);
+    }
+  }
+}
+
+function isRelevantPartialMatch(candidate, username) {
+  const candidateRaw = normalizeName(candidate, { stripTitles: false });
+  const usernameRaw = normalizeName(username, { stripTitles: false });
+  if (!candidateRaw || candidateRaw === usernameRaw) return false;
+
+  const candidateNormalized = normalizeName(candidate, { stripTitles: true });
+  const usernameNormalized = normalizeName(username, { stripTitles: true });
+  if (!candidateNormalized || !usernameNormalized) return false;
+
+  if (candidateNormalized === usernameNormalized) return true;
+
+  const usernameTokens = usernameNormalized.split(" ").filter(Boolean);
+  const candidateTokens = candidateNormalized.split(" ").filter(Boolean);
+  if (!usernameTokens.length || !candidateTokens.length) return false;
+
+  if (usernameTokens.every((token) => candidateTokens.includes(token))) {
+    return true;
+  }
+
+  const { exactMatches, fuzzyMatches, matchedCount } = countMatchedNameTokens(
+    usernameTokens,
+    candidateTokens
+  );
+
+  if (!exactMatches) return false;
+
+  if (matchedCount >= usernameTokens.length) {
+    return true;
+  }
+
+  if (usernameTokens.length >= 2 && candidateTokens.length >= 2) {
+    const firstTokenMatches = areSimilarNameTokens(usernameTokens[0], candidateTokens[0]);
+    const lastTokenMatches = areSimilarNameTokens(
+      usernameTokens[usernameTokens.length - 1],
+      candidateTokens[candidateTokens.length - 1]
+    );
+
+    if (firstTokenMatches && lastTokenMatches) {
+      return matchedCount >= Math.max(2, usernameTokens.length - 1) || fuzzyMatches > 0;
+    }
+  }
+
+  return false;
+}
+
+function countMatchedNameTokens(usernameTokens, candidateTokens) {
+  const remaining = [...candidateTokens];
+  let exactMatches = 0;
+  let fuzzyMatches = 0;
+
+  for (const usernameToken of usernameTokens) {
+    const exactIndex = remaining.indexOf(usernameToken);
+    if (exactIndex !== -1) {
+      exactMatches += 1;
+      remaining.splice(exactIndex, 1);
+      continue;
+    }
+
+    const fuzzyIndex = remaining.findIndex((candidateToken) =>
+      areSimilarNameTokens(usernameToken, candidateToken)
+    );
+    if (fuzzyIndex !== -1) {
+      fuzzyMatches += 1;
+      remaining.splice(fuzzyIndex, 1);
+    }
+  }
+
+  return {
+    exactMatches,
+    fuzzyMatches,
+    matchedCount: exactMatches + fuzzyMatches,
+  };
+}
+
+function areSimilarNameTokens(a, b) {
+  if (a === b) return true;
+
+  const left = String(a || "").trim();
+  const right = String(b || "").trim();
+  if (!left || !right) return false;
+
+  const shorter = left.length <= right.length ? left : right;
+  const longer = left.length <= right.length ? right : left;
+
+  if (shorter.length >= 4 && longer.includes(shorter)) {
+    return true;
+  }
+
+  if (shorter.length < 4) return false;
+
+  const distance = getLevenshteinDistance(left, right);
+  const maxLength = Math.max(left.length, right.length);
+
+  if (maxLength <= 5) return distance <= 1;
+  if (maxLength <= 8) return distance <= 2;
+  return distance <= 3;
+}
+
+function getLevenshteinDistance(a, b) {
+  const rows = a.length + 1;
+  const cols = b.length + 1;
+  const distances = Array.from({ length: rows }, (_, row) => {
+    const values = new Array(cols).fill(0);
+    values[0] = row;
+    return values;
+  });
+
+  for (let col = 0; col < cols; col += 1) {
+    distances[0][col] = col;
+  }
+
+  for (let row = 1; row < rows; row += 1) {
+    for (let col = 1; col < cols; col += 1) {
+      const substitutionCost = a[row - 1] === b[col - 1] ? 0 : 1;
+      distances[row][col] = Math.min(
+        distances[row - 1][col] + 1,
+        distances[row][col - 1] + 1,
+        distances[row - 1][col - 1] + substitutionCost
+      );
+    }
+  }
+
+  return distances[rows - 1][cols - 1];
+}
+
+async function waitForVisibleFilter(page, timeoutMs) {
+  const selectors = [
+    "#Filter_Criteria",
+    'input[name="Filter.Criteria"]',
+    'input[id*="Filter_Criteria"]',
+    'xpath=//label[contains(translate(normalize-space(.),"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"hide inactive")]/following::input[not(@type="checkbox") and not(@type="radio") and not(@type="hidden")][1]',
+    'xpath=//h1[contains(translate(normalize-space(.),"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"user list")]/following::input[not(@type="checkbox") and not(@type="radio") and not(@type="hidden")][1]',
+    'input[placeholder*="search" i]',
+    'input[type="search"]',
+  ];
+
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    for (const selector of selectors) {
+      const locator = page.locator(selector).first();
+      const visible = await locator.isVisible({ timeout: 150 }).catch(() => false);
+      if (visible) return locator;
+    }
+    await page.waitForTimeout(200);
+  }
+
+  throw new Error("User list filter input not visible");
+}
+
+async function waitForResultsToSettle(page, filter, term, baselineSnapshot, timeoutMs = 6000) {
+  const startedAt = Date.now();
+  const normalizedTerm = normalizeName(term, { stripTitles: false });
+  let lastSnapshot = "";
+  let stableCount = 0;
+  let sawChange = false;
+
+  while (Date.now() - startedAt < timeoutMs) {
+    const inputValue = normalizeName(await filter.inputValue().catch(() => ""), {
+      stripTitles: false,
+    });
+    const snapshot = await readUserListSnapshot(page);
+    if (snapshot !== baselineSnapshot) {
+      sawChange = true;
+    }
+
+    const minWaitMs = sawChange ? 300 : 900;
+    if (inputValue === normalizedTerm && Date.now() - startedAt >= minWaitMs) {
+      if (snapshot === lastSnapshot) {
+        stableCount += 1;
+      } else {
+        stableCount = 0;
+      }
+
+      if (stableCount >= 2) {
+        return;
+      }
+    }
+
+    lastSnapshot = snapshot;
+    await page.waitForTimeout(200);
+  }
+}
+
+async function readUserListSnapshot(page) {
+  const users = await readVisibleUsernames(page);
+  const tableText = await page.locator("table tbody").innerText().catch(() => "");
+  return JSON.stringify({
+    users,
+    tableText: String(tableText || "").replace(/\s+/g, " ").trim(),
+  });
 }
 
 module.exports = verifyDocmanUsers;

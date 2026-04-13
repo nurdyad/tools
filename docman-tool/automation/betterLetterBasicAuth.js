@@ -5,6 +5,7 @@ const path = require("path");
 function findProjectRoot(startDir) {
   let dir = startDir;
   while (true) {
+    if (fs.existsSync(path.join(dir, "run.js"))) return dir;
     const candidate = path.join(dir, "package.json");
     if (fs.existsSync(candidate)) return dir;
     const parent = path.dirname(dir);
@@ -25,7 +26,7 @@ function loadBetterLetterBasicAuth() {
     return { username: envUser, password: envPass };
   }
 
-  // Fallback to local file (M: only on your machine
+  // Fallback to local file (for machine-local secrets)
   if (fs.existsSync(AUTH_FILE)) {
     try {
       const raw = fs.readFileSync(AUTH_FILE, "utf8");
@@ -34,7 +35,7 @@ function loadBetterLetterBasicAuth() {
         return { username: parsed.username, password: parsed.password };
       }
     } catch (_) {
-      // ignore and behave as "not set"
+      // Ignore and behave as "not set"
     }
   }
 
@@ -50,7 +51,7 @@ function saveBetterLetterBasicAuth({ username, password }) {
     "utf8"
   );
 
-  // best-effort: restrict permissions on mac/linux
+  // Best-effort: restrict permissions on macOS/linux
   try {
     fs.chmodSync(AUTH_FILE, 0o600);
   } catch (_) {}
