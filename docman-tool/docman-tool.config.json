@@ -1,0 +1,52 @@
+{
+  "modeDefaults": {
+    "defaultMode": "login"
+  },
+  "browser": {
+    "window": {
+      "width": 1440,
+      "height": 900,
+      "positionX": 40,
+      "positionY": 40
+    },
+    "preDocmanHeadless": true,
+    "allowVisibleFallback": false,
+    "step4Visible": true,
+    "step4UseCurrentChrome": true,
+    "step4BrowserEngine": "chrome",
+    "chromeCdpUrl": "http://127.0.0.1:9222"
+  },
+  "betterLetter": {
+    "basicAuth": {
+      "username": "",
+      "password": ""
+    }
+  },
+  "clean": {
+    "batchSize": 50,
+    "defaultSourceFolder": "",
+    "defaultDestinationFolder": "",
+    "folderPicker": {
+      "enabled": true,
+      "maxSuggestions": 10,
+      "maxScrollPasses": 90
+    }
+  },
+  "retries": {
+    "step": {
+      "attempts": 2,
+      "baseDelayMs": 500,
+      "maxDelayMs": 3000
+    }
+  },
+  "timeouts": {
+    "navigationMs": 60000,
+    "selectorMs": 60000,
+    "docmanLoginFastCheckMs": 3500,
+    "docmanLoginDeepCheckMs": 9000
+  },
+  "logging": {
+    "enabled": true,
+    "directory": "logs"
+  }
+}

@@ -1,0 +1,11 @@
+# Runtime secrets
+.env
+.betterletter-basic-auth.json
+
+# Runtime logs and artifacts
+logs/
+*.jsonl
+
+# Browser/session runtime files
+.browser-profile/
+playwright-profile.lock

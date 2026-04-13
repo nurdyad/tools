@@ -1,22 +1,135 @@
 const fs = require("fs");
 const path = require("path");
 const inquirer = require("inquirer").default;
+const { withRetry } = require("./automation/retry");
+const { classifyError } = require("./automation/runLogger");
 
 const UUID_REGEX =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+const CLEAN_FOLDER_GROUPS = {
+  processing: [
+    "BetterLetter: Processing",
+    "zz BL Processing. Do not touch",
+  ],
+  filing: [
+    "BetterLetter: Filing",
+    "zz BL Filing. Do not touch",
+  ],
+  input: [
+    "BetterLetter: Input",
+    "zz BL Input. Do not touch",
+  ],
+};
+const FILING_DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/;
+const FILING_DOCUMENT_ID_REGEX = /^[A-Za-z0-9][A-Za-z0-9-]{2,}$/;
+const FILING_TITLE_SEGMENT_REGEX = /^[A-Za-z0-9][A-Za-z0-9 &'()\/.,:-]*$/;
 
-async function cleanBetterLetterProcessing({ page, batchSize = 50, dryRun = false }) {
+function normalizeRetryPolicy(retryPolicy = {}) {
+  const attempts = Number.isInteger(retryPolicy?.attempts) ? retryPolicy.attempts : 1;
+  const baseDelayMs = Number.isFinite(retryPolicy?.baseDelayMs)
+    ? Math.max(0, Math.floor(retryPolicy.baseDelayMs))
+    : 0;
+  const maxDelayMs = Number.isFinite(retryPolicy?.maxDelayMs)
+    ? Math.max(baseDelayMs, Math.floor(retryPolicy.maxDelayMs))
+    : baseDelayMs;
+
+  return {
+    attempts: Math.max(1, attempts),
+    baseDelayMs,
+    maxDelayMs,
+  };
+}
+
+function normalizeFolderPickerOptions(folderPicker = {}) {
+  return {
+    enabled: folderPicker?.enabled !== false,
+    maxSuggestions: Number.isInteger(folderPicker?.maxSuggestions)
+      ? Math.min(Math.max(folderPicker.maxSuggestions, 3), 25)
+      : 10,
+    maxScrollPasses: Number.isInteger(folderPicker?.maxScrollPasses)
+      ? Math.min(Math.max(folderPicker.maxScrollPasses, 10), 400)
+      : 90,
+  };
+}
+
+async function cleanBetterLetterProcessing({
+  page,
+  cleanType = "",
+  batchSize = 50,
+  dryRun = false,
+  defaults = {},
+  inputs = {},
+  folderPicker = {},
+  retryPolicy = {},
+  logger = null,
+}) {
+  const resolvedRetry = normalizeRetryPolicy(retryPolicy);
+  const pickerOptions = normalizeFolderPickerOptions(folderPicker);
+  const sourceDefault = String(defaults?.sourceFolder || "").trim();
+  const destinationDefault = String(defaults?.destinationFolder || "").trim();
+  const sourceInput = String(inputs?.sourceFolder || "").trim();
+  const destinationInput = String(inputs?.destinationFolder || "").trim();
+  const autoConfirmMove = Boolean(inputs?.autoConfirmMove);
+  const nonInteractive = Boolean(inputs?.nonInteractive);
+  const normalizedCleanType = normalizeCleanType(cleanType);
+  const cleanProfile = getCleanProfile(normalizedCleanType);
+
   try {
     const scope = await resolveFilingScope(page);
+    logger?.event("clean_scope_resolved", {
+      scopeType: scope === page ? "main_page" : "iframe",
+      cleanType: normalizedCleanType || "manual",
+      dryRun,
+      batchSize,
+    });
+
     console.log(`ℹ CLEAN scope resolved: ${scope === page ? "main page" : "iframe"}`);
     await loadFilingScreen(scope);
 
+    const availableFolders = cleanProfile
+      ? await collectFolderNames(scope, pickerOptions).catch(() => [])
+      : [];
+
     // SOURCE
-    const sourceFolder = await promptUntilFolderLoads(
-      scope,
-      "Enter SOURCE folder name to scan (exact match):"
-    );
-    if (!sourceFolder) return;
+    let sourceFolder = sourceInput;
+    if (sourceFolder) {
+      console.log(`✔ Enter SOURCE folder name to scan (exact match): ${sourceFolder}`);
+      console.log(`🔎 Trying to load source folder: "${sourceFolder}"`);
+      await withTimeout(
+        loadFilingFolder(scope, sourceFolder),
+        30000,
+        `Timed out while loading folder "${sourceFolder}"`
+      );
+    } else if (cleanProfile) {
+      sourceFolder = await resolveFirstExistingFolder(
+        scope,
+        cleanProfile.sourceFolderCandidates,
+        availableFolders
+      );
+      if (!sourceFolder) {
+        throw new Error(
+          `Could not find a ${cleanProfile.label} source folder. Tried: ${cleanProfile.sourceFolderCandidates.join(
+            " | "
+          )}`
+        );
+      }
+      console.log(`✔ CLEAN source folder auto-resolved: ${sourceFolder}`);
+      await withTimeout(
+        loadFilingFolder(scope, sourceFolder),
+        30000,
+        `Timed out while loading folder "${sourceFolder}"`
+      );
+    } else {
+      sourceFolder = await promptUntilFolderLoads(
+        scope,
+        "Enter SOURCE folder name to scan:",
+        {
+          defaultFolder: sourceDefault,
+          pickerOptions,
+        }
+      );
+      if (!sourceFolder) return;
+    }
 
     // SCAN (strong selector)
     const allTitles = await scope.$$eval(
@@ -30,18 +143,27 @@ async function cleanBetterLetterProcessing({ page, batchSize = 50, dryRun = fals
       );
     }
 
-    const nonUuidTitles = allTitles.filter((t) => !UUID_REGEX.test(t));
+    const titlesToMove = allTitles.filter((title) =>
+      cleanProfile ? cleanProfile.shouldMoveTitle(title) : !UUID_REGEX.test(title)
+    );
+
+    logger?.event("clean_scan_complete", {
+      cleanType: normalizedCleanType || "manual",
+      sourceFolder,
+      totalDocuments: allTitles.length,
+      matchedDocuments: titlesToMove.length,
+    });
 
     console.log(`\n📄 Documents detected: ${allTitles.length}`);
-    console.log(`Found ${nonUuidTitles.length} NON-UUID documents.`);
+    console.log(`Found ${titlesToMove.length} ${cleanProfile?.matchLabel || "NON-UUID documents"}.`);
 
-    if (!nonUuidTitles.length) {
+    if (!titlesToMove.length) {
       console.log("Nothing to move.");
       return;
     }
 
     console.log("\nExamples:");
-    nonUuidTitles.slice(0, 10).forEach((t) => console.log(" -", t));
+    titlesToMove.slice(0, 10).forEach((t) => console.log(" -", t));
 
     if (dryRun) {
       console.log("\n🟡 DRY RUN — no changes made.");
@@ -49,17 +171,55 @@ async function cleanBetterLetterProcessing({ page, batchSize = 50, dryRun = fals
     }
 
     // DESTINATION
-    const destinationFolder = await promptUntilFolderExists(
-      scope,
-      "Enter destination folder name (exact match):",
-      { nonDisruptive: true }
-    );
-    if (!destinationFolder) return;
+    let destinationFolder = destinationInput;
+    if (destinationFolder) {
+      console.log(`✔ Enter destination folder name (exact match): ${destinationFolder}`);
+      const found = await findFolderLinkWithOptions(scope, destinationFolder, {
+        prepare: false,
+      });
+      if (!found) {
+        throw new Error(`Folder "${destinationFolder}" not found.`);
+      }
+    } else if (cleanProfile) {
+      destinationFolder = await resolveFirstExistingFolder(
+        scope,
+        cleanProfile.destinationFolderCandidates,
+        availableFolders
+      );
+      if (!destinationFolder) {
+        throw new Error(
+          `Could not find an input folder. Tried: ${cleanProfile.destinationFolderCandidates.join(
+            " | "
+          )}`
+        );
+      }
+      console.log(`✔ CLEAN destination folder auto-resolved: ${destinationFolder}`);
+    } else {
+      destinationFolder = await promptUntilFolderExists(
+        scope,
+        "Enter destination folder name:",
+        {
+          nonDisruptive: true,
+          defaultFolder: destinationDefault,
+          pickerOptions,
+        }
+      );
+      if (!destinationFolder) return;
+    }
 
-    const proceed = await promptYesNo(
-      `Move ${nonUuidTitles.length} documents to "${destinationFolder}"?`
-    );
+    let proceed = autoConfirmMove;
+    if (proceed) {
+      console.log(`✔ Move ${titlesToMove.length} documents to "${destinationFolder}"? Yes`);
+    } else {
+      proceed = await promptYesNo(
+        `Move ${titlesToMove.length} documents to "${destinationFolder}"?`
+      );
+    }
+
     if (!proceed) {
+      if (nonInteractive) {
+        throw new Error("Move confirmation required in non-interactive mode. Use --yes.");
+      }
       console.log("Cancelled. No documents were moved.");
       return;
     }
@@ -75,36 +235,170 @@ async function cleanBetterLetterProcessing({ page, batchSize = 50, dryRun = fals
     // MOVE
     await ensureSelectMode(scope);
 
-    let remaining = [...nonUuidTitles];
+    let remaining = [...titlesToMove];
     let batch = 1;
 
     while (remaining.length) {
       const current = remaining.slice(0, batchSize);
+      const startedAt = Date.now();
       console.log(`\nBatch ${batch}: moving ${current.length}`);
 
-      await dismissTransientBlockingModals(scope, "before selecting documents");
-      await selectDocumentsByTitle(scope, current);
-      await dismissTransientBlockingModals(scope, "after selecting documents");
-      await openChangeFolder(scope);
-      await dismissTransientBlockingModals(scope, "before choosing destination folder");
-      await moveToFolder(scope, destinationFolder);
-      await dismissTransientBlockingModals(scope, "after confirming move");
+      logger?.event("clean_batch_start", {
+        batch,
+        inBatch: current.length,
+        remainingBefore: remaining.length,
+        destinationFolder,
+      });
+
+      await withRetry(
+        async () => {
+          await dismissTransientBlockingModals(scope, "before selecting documents");
+          await selectDocumentsByTitle(scope, current);
+          await dismissTransientBlockingModals(scope, "after selecting documents");
+          await openChangeFolder(scope);
+          await dismissTransientBlockingModals(scope, "before choosing destination folder");
+          await moveToFolder(scope, destinationFolder);
+          await dismissTransientBlockingModals(scope, "after confirming move");
+        },
+        {
+          ...resolvedRetry,
+          label: `clean batch ${batch}`,
+          onRetry: ({ nextAttempt, attempts, delayMs, error }) => {
+            console.log(
+              `↻ Batch ${batch} failed (${error?.message || "unknown error"}). ` +
+                `retry ${nextAttempt}/${attempts} in ${delayMs}ms`
+            );
+            logger?.event("clean_batch_retry", {
+              batch,
+              nextAttempt,
+              attempts,
+              delayMs,
+              errorType: classifyError(error),
+              errorMessage: error?.message || "unknown error",
+            });
+          },
+        }
+      );
+
+      const durationMs = Date.now() - startedAt;
+      logger?.event("clean_batch_end", {
+        batch,
+        moved: current.length,
+        durationMs,
+      });
 
       remaining = remaining.slice(batchSize);
       batch++;
 
-      await waitForTimeout(scope, 700);
-      await ensureSelectMode(scope);
+      if (remaining.length) {
+        await waitForTimeout(scope, 700);
+        await ensureSelectMode(scope);
+      }
     }
 
     console.log("\n✔ All documents moved.");
   } catch (err) {
+    logger?.event("clean_failed", {
+      errorType: classifyError(err),
+      errorMessage: err?.message || String(err),
+    });
     console.error("❌ CLEAN FAILED:", err.message);
     await page.screenshot({ path: "clean-failure.png", fullPage: true }).catch(() => {});
     throw err;
   }
 }
 
+function normalizeCleanType(cleanTypeInput) {
+  const cleanType = String(cleanTypeInput || "").trim().toLowerCase();
+  if (
+    cleanType === "processing" ||
+    cleanType === "process" ||
+    cleanType === "proc" ||
+    cleanType === "processing-folder"
+  ) {
+    return "processing";
+  }
+  if (
+    cleanType === "filing" ||
+    cleanType === "file" ||
+    cleanType === "fiiling" ||
+    cleanType === "filing-folder"
+  ) {
+    return "filing";
+  }
+  return "";
+}
+
+function getCleanProfile(cleanType) {
+  if (cleanType === "processing") {
+    return {
+      label: "processing",
+      sourceFolderCandidates: CLEAN_FOLDER_GROUPS.processing,
+      destinationFolderCandidates: CLEAN_FOLDER_GROUPS.input,
+      matchLabel: "NON-UUID documents",
+      shouldMoveTitle: (title) => !UUID_REGEX.test(String(title || "").trim()),
+    };
+  }
+
+  if (cleanType === "filing") {
+    return {
+      label: "filing",
+      sourceFolderCandidates: CLEAN_FOLDER_GROUPS.filing,
+      destinationFolderCandidates: CLEAN_FOLDER_GROUPS.input,
+      matchLabel: "filing titles that do not match the BetterLetter pattern",
+      shouldMoveTitle: (title) => !matchesExpectedFilingTitle(title),
+    };
+  }
+
+  return null;
+}
+
+function matchesExpectedFilingTitle(title) {
+  const normalized = String(title || "").trim();
+  if (!normalized) return false;
+
+  const parts = normalized
+    .split("_")
+    .map((part) => part.trim())
+    .filter(Boolean);
+
+  if (parts.length < 5) {
+    return false;
+  }
+
+  const datePart = parts[parts.length - 2];
+  const documentIdPart = parts[parts.length - 1];
+  if (!FILING_DATE_REGEX.test(datePart)) {
+    return false;
+  }
+  if (!FILING_DOCUMENT_ID_REGEX.test(documentIdPart)) {
+    return false;
+  }
+
+  return parts
+    .slice(0, -2)
+    .every((part) => FILING_TITLE_SEGMENT_REGEX.test(part));
+}
+
+async function resolveFirstExistingFolder(scope, candidates, availableFolders = []) {
+  for (const candidate of candidates) {
+    const exact = findExactFolderMatch(availableFolders, candidate);
+    if (exact) {
+      return exact;
+    }
+  }
+
+  for (const candidate of candidates) {
+    const found = await findFolderLinkWithOptions(scope, candidate, {
+      prepare: false,
+    });
+    if (found) {
+      return candidate;
+    }
+  }
+
+  return "";
+}
 /* ---------------- scope helpers ---------------- */
 
 async function resolveFilingScope(page) {
@@ -201,9 +495,20 @@ async function resolveActionScope(scope, { requireDocumentList = false } = {}) {
 
 /* ---------------- folder helpers ---------------- */
 
-async function promptUntilFolderLoads(scope, promptMsg) {
+async function promptUntilFolderLoads(scope, promptMsg, options = {}) {
+  const { defaultFolder = "", pickerOptions = { enabled: true } } = options;
+  const availableFolders = await collectFolderNames(scope, pickerOptions).catch(() => []);
+
+  if (pickerOptions.enabled && availableFolders.length) {
+    console.log(`ℹ Folder picker indexed ${availableFolders.length} folder(s).`);
+  }
+
   while (true) {
-    const name = await promptText(promptMsg);
+    const name = await promptFolderChoice(promptMsg, {
+      defaultFolder,
+      availableFolders,
+      pickerOptions,
+    });
 
     if (!name) {
       console.log("Cancelled.");
@@ -225,9 +530,24 @@ async function promptUntilFolderLoads(scope, promptMsg) {
 }
 
 async function promptUntilFolderExists(scope, promptMsg, options = {}) {
-  const { nonDisruptive = false } = options;
+  const {
+    nonDisruptive = false,
+    defaultFolder = "",
+    pickerOptions = { enabled: true },
+  } = options;
+
+  const availableFolders = await collectFolderNames(scope, pickerOptions).catch(() => []);
+
+  if (pickerOptions.enabled && availableFolders.length) {
+    console.log(`ℹ Folder picker indexed ${availableFolders.length} folder(s).`);
+  }
+
   while (true) {
-    const name = await promptText(promptMsg);
+    const name = await promptFolderChoice(promptMsg, {
+      defaultFolder,
+      availableFolders,
+      pickerOptions,
+    });
 
     if (!name) {
       console.log("Cancelled.");
@@ -243,6 +563,192 @@ async function promptUntilFolderExists(scope, promptMsg, options = {}) {
   }
 }
 
+async function promptFolderChoice(promptMsg, options = {}) {
+  const {
+    defaultFolder = "",
+    availableFolders = [],
+    pickerOptions = { enabled: true, maxSuggestions: 10 },
+  } = options;
+
+  if (!pickerOptions.enabled || !availableFolders.length) {
+    return await promptText(promptMsg, defaultFolder);
+  }
+
+  let query = await promptText(`${promptMsg} (type a folder name or part of it):`, defaultFolder);
+
+  while (true) {
+    if (!query) return "";
+
+    const exact = findExactFolderMatch(availableFolders, query);
+    if (exact) return exact;
+
+    const suggestions = getFolderSuggestions(
+      availableFolders,
+      query,
+      pickerOptions.maxSuggestions
+    );
+
+    if (!suggestions.length) {
+      console.log(`No folder matches found for "${query}".`);
+      const useTyped = await promptYesNo(`Use exactly "${query}" anyway?`);
+      if (useTyped) return query;
+
+      query = await promptText("Try another folder search (or ENTER to cancel):");
+      continue;
+    }
+
+    console.log("\nTop folder matches:");
+    console.log(` 0. Use exactly: ${query}`);
+    suggestions.forEach((name, index) => {
+      console.log(` ${index + 1}. ${name}`);
+    });
+
+    const pick = await promptText(
+      `Choose number 0-${suggestions.length}, or type a new search:`
+    );
+
+    if (!pick) return "";
+
+    const asNumber = Number(pick);
+    if (Number.isInteger(asNumber) && asNumber === 0) {
+      return query;
+    }
+    if (Number.isInteger(asNumber) && asNumber >= 1 && asNumber <= suggestions.length) {
+      return suggestions[asNumber - 1];
+    }
+
+    const typedExact = findExactFolderMatch(availableFolders, pick);
+    if (typedExact) return typedExact;
+
+    query = pick;
+  }
+}
+
+async function collectFolderNames(scope, pickerOptions = {}) {
+  if (pickerOptions.enabled === false) return [];
+
+  await withTimeout(loadFilingScreen(scope), 10000, "Filing screen not ready for folder picker");
+
+  const tree = scope.locator("#folders_list, #folders").first();
+  await tree.waitFor({ state: "attached", timeout: 20000 });
+
+  const folderMap = new Map();
+  const maxScrollPasses = Number.isInteger(pickerOptions.maxScrollPasses)
+    ? pickerOptions.maxScrollPasses
+    : 90;
+
+  await tree
+    .evaluate((el) => {
+      el.scrollTop = 0;
+    })
+    .catch(() => {});
+
+  for (let i = 0; i < maxScrollPasses; i++) {
+    const labels = await tree
+      .locator("li, a, span")
+      .evaluateAll((nodes) => {
+        const output = [];
+        for (const node of nodes) {
+          const text = (node.textContent || "").replace(/\s+/g, " ").trim();
+          if (!text) continue;
+          if (text.length < 2) continue;
+          if (text.length > 100) continue;
+          output.push(text);
+        }
+        return output;
+      })
+      .catch(() => []);
+
+    for (const raw of labels) {
+      const normalized = normalizeFolderLabel(raw);
+      if (!normalized) continue;
+      const key = normalized.toLowerCase();
+      if (!folderMap.has(key)) folderMap.set(key, normalized);
+    }
+
+    const didScroll = await tree
+      .evaluate((el) => {
+        const before = el.scrollTop;
+        el.scrollTop = before + el.clientHeight * 0.9;
+        return el.scrollTop !== before;
+      })
+      .catch(() => false);
+
+    if (!didScroll) break;
+    await waitForTimeout(scope, 30);
+  }
+
+  await tree
+    .evaluate((el) => {
+      el.scrollTop = 0;
+    })
+    .catch(() => {});
+
+  return Array.from(folderMap.values()).sort((a, b) => a.localeCompare(b));
+}
+
+function normalizeFolderLabel(text) {
+  const compact = String(text || "").replace(/\s+/g, " ").trim();
+  if (!compact) return "";
+
+  const noCount = compact.replace(/\s+\d+$/, "").trim();
+  return noCount || compact;
+}
+
+function findExactFolderMatch(folders, query) {
+  const normalizedQuery = String(query || "").trim().toLowerCase();
+  if (!normalizedQuery) return null;
+
+  return (
+    folders.find((name) => String(name || "").trim().toLowerCase() === normalizedQuery) || null
+  );
+}
+
+function getFolderSuggestions(folders, query, maxSuggestions = 10) {
+  const normalizedQuery = String(query || "").trim().toLowerCase();
+  const max = Number.isInteger(maxSuggestions) ? maxSuggestions : 10;
+  const scored = [];
+
+  for (const name of folders) {
+    const score = scoreFolderCandidate(name, normalizedQuery);
+    if (score < 0) continue;
+    scored.push({ name, score });
+  }
+
+  scored.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    return a.name.localeCompare(b.name);
+  });
+
+  return scored.slice(0, max).map((item) => item.name);
+}
+
+function scoreFolderCandidate(name, query) {
+  const candidate = String(name || "").toLowerCase();
+  if (!candidate) return -1;
+  if (!query) return 1;
+  if (candidate === query) return 10000;
+  if (candidate.startsWith(query)) return 8000 - Math.abs(candidate.length - query.length);
+
+  const idx = candidate.indexOf(query);
+  if (idx >= 0) return 6000 - idx;
+
+  if (isSubsequence(query, candidate)) {
+    return 3000 - (candidate.length - query.length);
+  }
+
+  return -1;
+}
+
+function isSubsequence(needle, haystack) {
+  if (!needle) return true;
+  let i = 0;
+  for (let j = 0; j < haystack.length; j++) {
+    if (haystack[j] === needle[i]) i += 1;
+    if (i >= needle.length) return true;
+  }
+  return false;
+}
 async function loadFilingScreen(scope) {
   const allDocs = scope.locator("span.all-docs-count").first();
   if ((await allDocs.count().catch(() => 0)) > 0) {
@@ -1110,13 +1616,14 @@ function promptYesNo(q) {
     .then((ans) => Boolean(ans.value));
 }
 
-function promptText(q) {
+function promptText(q, defaultValue = "") {
   return inquirer
     .prompt([
       {
         type: "input",
         name: "value",
         message: q,
+        default: defaultValue,
       },
     ])
     .then((ans) => (ans.value || "").trim());
