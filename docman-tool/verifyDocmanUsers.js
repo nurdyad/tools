@@ -336,7 +336,10 @@ function areSimilarNameTokens(a, b) {
   const shorter = left.length <= right.length ? left : right;
   const longer = left.length <= right.length ? right : left;
 
-  if (shorter.length >= 4 && longer.includes(shorter)) {
+  // Short names are very often a nickname that's a literal prefix of the full
+  // name (Sam/Samantha, Ben/Benjamin, Al/Albert), so allow substring
+  // containment down to 2 characters instead of requiring 4+.
+  if (shorter.length >= 2 && longer.includes(shorter)) {
     return true;
   }
 
