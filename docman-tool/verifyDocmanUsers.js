@@ -17,6 +17,16 @@ async function verifyDocmanUsers({ page, usernames }) {
   const baseUrl = new URL(page.url()).origin;
   console.log("✔ Docman environment detected:", baseUrl);
 
+  let groupNames = [];
+  try {
+    groupNames = await readAllRecipientGroupNames(page, baseUrl);
+    console.log(`✔ Loaded ${groupNames.length} Docman recipient group(s).`);
+  } catch (error) {
+    console.log(
+      `⚠ Could not load Docman recipient groups, continuing with users only: ${error.message}`
+    );
+  }
+
   // Navigate to User List using the detected environment.
   await page.goto(`${baseUrl}/Admin/Users/UserList`, {
     waitUntil: "domcontentloaded",
@@ -41,6 +51,7 @@ async function verifyDocmanUsers({ page, usernames }) {
   for (const username of usernames) {
     const exactCandidates = await runSearch(page, filter, username);
     let exactMatch = findBestResolvedMatch(exactCandidates, username);
+    let matchType = exactMatch ? "user" : null;
     const partialMatches = [];
 
     if (!exactMatch) {
@@ -52,6 +63,7 @@ async function verifyDocmanUsers({ page, usernames }) {
         const resolvedFromPart = findBestResolvedMatch(partCandidates, username);
         if (resolvedFromPart) {
           exactMatch = resolvedFromPart;
+          matchType = "user";
           break;
         }
 
@@ -60,16 +72,95 @@ async function verifyDocmanUsers({ page, usernames }) {
       }
     }
 
+    if (!exactMatch && groupNames.length) {
+      const exactGroupMatch = findBestResolvedMatch(groupNames, username);
+      if (exactGroupMatch) {
+        exactMatch = exactGroupMatch;
+        matchType = "group";
+      } else if (partialMatches.length < 5) {
+        addRelevantPartialMatches(partialMatches, groupNames, username);
+      }
+    }
+
     results.push({
       searchedName: username,
       exists: Boolean(exactMatch),
       docmanUsername: exactMatch || null,
+      matchType,
       partialMatches: partialMatches.length ? partialMatches : null,
       needsManualReview: !exactMatch && partialMatches.length > 0,
     });
   }
 
   return results;
+}
+
+async function readAllRecipientGroupNames(page, baseUrl) {
+  await page.goto(`${baseUrl}/Admin/RecipientGroups/RecipientGroupList`, {
+    waitUntil: "domcontentloaded",
+    timeout: 60000,
+  });
+
+  const authState = await inspectDocmanLoginState(page);
+  if (authState.onLoginPage) {
+    throw new Error(
+      `Docman redirected to login while opening Recipient Groups. Current URL: ${authState.url}`
+    );
+  }
+
+  await page.waitForSelector("table", { timeout: 60000 });
+
+  const names = new Set();
+  const addCurrentPageRows = async () => {
+    for (const name of await readRecipientGroupTableRows(page)) {
+      names.add(name);
+    }
+  };
+
+  await addCurrentPageRows();
+
+  const pageHrefs = await page.evaluate(() =>
+    Array.from(
+      document.querySelectorAll('a.dropdown-item[href*="RecipientGroups/PageMove"]')
+    ).map((a) => a.getAttribute("href"))
+  );
+
+  // The pagination links live inside a collapsed dropdown, so they aren't
+  // "visible" to Playwright's normal click - dispatch a real click on the
+  // anchor directly (a plain page.goto to the same href does not reliably
+  // advance Docman's server-side paging state).
+  for (const href of pageHrefs) {
+    const clicked = await page.evaluate((targetHref) => {
+      const link = document.querySelector(`a.dropdown-item[href="${targetHref}"]`);
+      if (!link) return false;
+      link.click();
+      return true;
+    }, href);
+    if (!clicked) continue;
+
+    await page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => {});
+    await page.waitForTimeout(300);
+    await addCurrentPageRows();
+  }
+
+  return [...names];
+}
+
+async function readRecipientGroupTableRows(page) {
+  return await page.evaluate(() => {
+    const tables = Array.from(document.querySelectorAll("table"));
+    const groupTable = tables.find((table) =>
+      /description/i.test((table.querySelector("thead") || {}).textContent || "")
+    );
+    if (!groupTable) return [];
+
+    return Array.from(groupTable.querySelectorAll("tbody tr"))
+      .map((row) => {
+        const firstCell = row.querySelector("td");
+        return firstCell ? firstCell.textContent.trim() : "";
+      })
+      .filter(Boolean);
+  });
 }
 
 async function waitForUserListReady(page) {
