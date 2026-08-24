@@ -169,7 +169,15 @@ async function bootstrapDocmanSession(practiceInput, sessionOptions = {}) {
     });
   }
 
-  const { odsCode, adminUsername, adminPassword } = creds;
+  const {
+    odsCode,
+    adminUsername,
+    adminPassword,
+    inputFolder,
+    processingFolder,
+    filingFolder,
+    rejectedFolder,
+  } = creds;
 
   if (step4Visible) {
     const attachToExistingChrome = Boolean(step4UseCurrentChrome);
@@ -274,6 +282,10 @@ async function bootstrapDocmanSession(practiceInput, sessionOptions = {}) {
     odsCode,
     adminUsername,
     adminPassword,
+    inputFolder,
+    processingFolder,
+    filingFolder,
+    rejectedFolder,
     headless: runningHeadless,
     browserEngine: browserSession?.browserEngine,
     isExternalBrowser: Boolean(browserSession?.isExternalBrowser),

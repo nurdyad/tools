@@ -6,21 +6,25 @@ const { classifyError } = require("./automation/runLogger");
 
 const UUID_REGEX =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+// Fallback guesses only - practices can name these folders almost anything
+// (Grove Medical Centre uses "1.For BetterLetter" / "2.Processing by
+// BetterLetter" / "3.Filing by BetterLetter", a third convention besides
+// these two), so the authoritative source is each practice's own EHR
+// Settings folder-name fields (see fetchDocmanCreds.js), passed in via
+// inputs.sourceFolder/destinationFolder and used before ever reaching this
+// list. This only matters when that lookup comes back empty.
 const CLEAN_FOLDER_GROUPS = {
   processing: [
     "BetterLetter: Processing",
     "zz BL Processing. Do not touch",
-    "2.Processing by BetterLetter",
   ],
   filing: [
     "BetterLetter: Filing",
     "zz BL Filing. Do not touch",
-    "3.Filing by BetterLetter",
   ],
   input: [
     "BetterLetter: Input",
     "zz BL Input. Do not touch",
-    "1.For BetterLetter",
   ],
 };
 const FILING_DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/;
