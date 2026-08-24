@@ -107,10 +107,17 @@ async function cleanBetterLetterProcessing({
         availableFolders
       );
       if (!sourceFolder) {
+        console.log(
+          `ℹ Folders actually found in the tree (${availableFolders.length}): ${
+            availableFolders.length ? availableFolders.join(" | ") : "(none - tree may not have loaded)"
+          }`
+        );
         throw new Error(
           `Could not find a ${cleanProfile.label} source folder. Tried: ${cleanProfile.sourceFolderCandidates.join(
             " | "
-          )}`
+          )}. Folders actually found (${availableFolders.length}): ${
+            availableFolders.length ? availableFolders.slice(0, 15).join(" | ") : "none - tree may not have loaded"
+          }`
         );
       }
       console.log(`✔ CLEAN source folder auto-resolved: ${sourceFolder}`);
@@ -187,10 +194,17 @@ async function cleanBetterLetterProcessing({
         availableFolders
       );
       if (!destinationFolder) {
+        console.log(
+          `ℹ Folders actually found in the tree (${availableFolders.length}): ${
+            availableFolders.length ? availableFolders.join(" | ") : "(none - tree may not have loaded)"
+          }`
+        );
         throw new Error(
           `Could not find an input folder. Tried: ${cleanProfile.destinationFolderCandidates.join(
             " | "
-          )}`
+          )}. Folders actually found (${availableFolders.length}): ${
+            availableFolders.length ? availableFolders.slice(0, 15).join(" | ") : "none - tree may not have loaded"
+          }`
         );
       }
       console.log(`✔ CLEAN destination folder auto-resolved: ${destinationFolder}`);
