@@ -10,14 +10,17 @@ const CLEAN_FOLDER_GROUPS = {
   processing: [
     "BetterLetter: Processing",
     "zz BL Processing. Do not touch",
+    "2.Processing by BetterLetter",
   ],
   filing: [
     "BetterLetter: Filing",
     "zz BL Filing. Do not touch",
+    "3.Filing by BetterLetter",
   ],
   input: [
     "BetterLetter: Input",
     "zz BL Input. Do not touch",
+    "1.For BetterLetter",
   ],
 };
 const FILING_DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/;
