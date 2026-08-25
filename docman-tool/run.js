@@ -193,6 +193,7 @@ const { parseCliArgs, printCliHelp } = require("./automation/cliArgs");
       const taskResult = await executeMode({
         mode: activeMode,
         page,
+        session,
         cliOptions: activeCliOptions,
         config,
         runLogger,
@@ -546,6 +547,7 @@ function printPhaseBanner(title, lines = []) {
 async function executeMode({
   mode,
   page,
+  session,
   cliOptions,
   config,
   runLogger,
@@ -596,6 +598,30 @@ async function executeMode({
       console.log(`✔ CLEAN destination folder preset: ${cleanDestinationFolder}`);
     }
 
+    // Each practice names its Docman folders however it likes (e.g. Grove
+    // Medical Centre uses "1.For BetterLetter" / "2.Processing by
+    // BetterLetter", not either of the two generic conventions this tool
+    // otherwise guesses at) - the practice's own EHR Settings page is the
+    // actual source of truth, already read once during login (see
+    // fetchDocmanCreds.js), so prefer that over guessing. A CLI override
+    // still wins if one was given; if neither is available, cleanBetter-
+    // LetterProcessing falls back to its built-in guesses.
+    const ehrSourceFolder = cleanType === "processing"
+      ? String(session?.processingFolder || "").trim()
+      : cleanType === "filing"
+        ? String(session?.filingFolder || "").trim()
+        : "";
+    const ehrDestinationFolder = String(session?.inputFolder || "").trim();
+    const resolvedSourceFolder = String(cliOptions.clean.sourceFolder || "").trim() || ehrSourceFolder;
+    const resolvedDestinationFolder = String(cliOptions.clean.destinationFolder || "").trim() || ehrDestinationFolder;
+
+    if (!cliOptions.clean.sourceFolder && ehrSourceFolder) {
+      console.log(`✔ CLEAN source folder from practice's EHR Settings: ${ehrSourceFolder}`);
+    }
+    if (!cliOptions.clean.destinationFolder && ehrDestinationFolder) {
+      console.log(`✔ CLEAN destination folder from practice's EHR Settings: ${ehrDestinationFolder}`);
+    }
+
     if (typeof bootstrapDocmanSession.gotoDocmanFilingAndActivate === "function") {
       console.log("➡ Preparing Docman Filing for CLEAN workflow…");
       await runStepWithRetry({
@@ -626,8 +652,8 @@ async function executeMode({
             destinationFolder: cleanDestinationFolder,
           },
           inputs: {
-            sourceFolder: cliOptions.clean.sourceFolder,
-            destinationFolder: cliOptions.clean.destinationFolder,
+            sourceFolder: resolvedSourceFolder,
+            destinationFolder: resolvedDestinationFolder,
             autoConfirmMove: cliOptions.clean.autoConfirm,
             nonInteractive: cliOptions.nonInteractive,
           },

@@ -75,7 +75,20 @@ async function fetchDocmanCreds(page, practiceName) {
   console.log(`  ODS: ${odsCode}`);
   console.log(`  User: ${adminUsername}`);
 
-  return { odsCode, adminUsername, adminPassword };
+  // Best-effort: each practice configures its own Docman folder names here
+  // (e.g. "1.For BetterLetter" / "2.Processing by BetterLetter" - naming
+  // varies per practice), so read them directly instead of guessing at a
+  // fixed convention. Never throws - callers that don't need these (login,
+  // verify, etc.) just ignore empty values, and clean-processing falls back
+  // to its own folder-name guesses when a field can't be read here.
+  const folderNames = await readFolderNames(page, timeoutMs).catch(() => ({
+    inputFolder: "",
+    processingFolder: "",
+    filingFolder: "",
+    rejectedFolder: "",
+  }));
+
+  return { odsCode, adminUsername, adminPassword, ...folderNames };
 }
 
 async function openPracticeDetailsPage(page, link, timeoutMs) {
@@ -218,6 +231,76 @@ async function readDocmanInputs(page, timeoutMs) {
   const adminPassword = await passInput.inputValue().catch(() => "");
 
   return { adminUsername, adminPassword };
+}
+
+async function readFolderNames(page, timeoutMs) {
+  const [inputFolder, processingFolder, filingFolder, rejectedFolder] = await Promise.all([
+    readFieldByLabel(page, timeoutMs, "Input Folder", [
+      'input[name*="[input_folder]"]',
+      'input[name*="[folder_input]"]',
+    ]),
+    readFieldByLabel(page, timeoutMs, "Processing Folder", [
+      'input[name*="[processing_folder]"]',
+      'input[name*="[folder_processing]"]',
+    ]),
+    readFieldByLabel(page, timeoutMs, "Filing Folder", [
+      'input[name*="[filing_folder]"]',
+      'input[name*="[folder_filing]"]',
+    ]),
+    readFieldByLabel(page, timeoutMs, "Rejected Folder", [
+      'input[name*="[rejected_folder]"]',
+      'input[name*="[folder_rejected]"]',
+    ]),
+  ]);
+  return { inputFolder, processingFolder, filingFolder, rejectedFolder };
+}
+
+// Reads a folder-name value by its visible section label (e.g. "PROCESSING
+// FOLDER" on the practice's EHR Settings page), rather than a hardcoded form
+// field name - each practice sets its own Docman folder names here, so
+// there's no fixed convention to select by. Tries a same-container <input>
+// first in case it's an editable field, then falls back to reading whatever
+// plain text sits next to the label, since this section may just display
+// the configured name rather than let it be edited from this page.
+async function readFieldByLabel(page, timeoutMs, labelText, nameSelectorGuesses = []) {
+  if (nameSelectorGuesses.length) {
+    const guessed = page.locator(nameSelectorGuesses.join(", ")).first();
+    if ((await guessed.count().catch(() => 0)) > 0) {
+      const value = (await guessed.inputValue().catch(() => "")).trim();
+      if (value) return value;
+    }
+  }
+
+  const escapedLabel = labelText.toLowerCase();
+  const label = page.locator(
+    `xpath=//*[contains(translate(normalize-space(text()), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "${escapedLabel}") and string-length(normalize-space(text())) < 60]`
+  ).first();
+
+  const found = await label.waitFor({ state: "attached", timeout: Math.min(timeoutMs, 15000) })
+    .then(() => true)
+    .catch(() => false);
+  if (!found) return "";
+
+  const container = label.locator("xpath=ancestor::*[self::div or self::section][1]").first();
+  if ((await container.count().catch(() => 0)) === 0) return "";
+
+  const input = container.locator("input").first();
+  if ((await input.count().catch(() => 0)) > 0) {
+    const value = (await input.inputValue().catch(() => "")).trim();
+    if (value) return value;
+  }
+
+  const containerText = (await container.innerText().catch(() => "")) || "";
+  const labelOwnText = ((await label.innerText().catch(() => "")) || "").trim().toLowerCase();
+  const remainder = containerText
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line && line.toLowerCase() !== labelOwnText)
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return remainder;
 }
 
 function firstAvailableLocator(page, selectors) {

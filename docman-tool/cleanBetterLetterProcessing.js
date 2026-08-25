@@ -6,6 +6,13 @@ const { classifyError } = require("./automation/runLogger");
 
 const UUID_REGEX =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+// Fallback guesses only - practices can name these folders almost anything
+// (Grove Medical Centre uses "1.For BetterLetter" / "2.Processing by
+// BetterLetter" / "3.Filing by BetterLetter", a third convention besides
+// these two), so the authoritative source is each practice's own EHR
+// Settings folder-name fields (see fetchDocmanCreds.js), passed in via
+// inputs.sourceFolder/destinationFolder and used before ever reaching this
+// list. This only matters when that lookup comes back empty.
 const CLEAN_FOLDER_GROUPS = {
   processing: [
     "BetterLetter: Processing",
@@ -107,10 +114,17 @@ async function cleanBetterLetterProcessing({
         availableFolders
       );
       if (!sourceFolder) {
+        console.log(
+          `ℹ Folders actually found in the tree (${availableFolders.length}): ${
+            availableFolders.length ? availableFolders.join(" | ") : "(none - tree may not have loaded)"
+          }`
+        );
         throw new Error(
           `Could not find a ${cleanProfile.label} source folder. Tried: ${cleanProfile.sourceFolderCandidates.join(
             " | "
-          )}`
+          )}. Folders actually found (${availableFolders.length}): ${
+            availableFolders.length ? availableFolders.slice(0, 15).join(" | ") : "none - tree may not have loaded"
+          }`
         );
       }
       console.log(`✔ CLEAN source folder auto-resolved: ${sourceFolder}`);
@@ -187,10 +201,17 @@ async function cleanBetterLetterProcessing({
         availableFolders
       );
       if (!destinationFolder) {
+        console.log(
+          `ℹ Folders actually found in the tree (${availableFolders.length}): ${
+            availableFolders.length ? availableFolders.join(" | ") : "(none - tree may not have loaded)"
+          }`
+        );
         throw new Error(
           `Could not find an input folder. Tried: ${cleanProfile.destinationFolderCandidates.join(
             " | "
-          )}`
+          )}. Folders actually found (${availableFolders.length}): ${
+            availableFolders.length ? availableFolders.slice(0, 15).join(" | ") : "none - tree may not have loaded"
+          }`
         );
       }
       console.log(`✔ CLEAN destination folder auto-resolved: ${destinationFolder}`);
