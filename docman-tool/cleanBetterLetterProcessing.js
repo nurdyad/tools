@@ -81,6 +81,12 @@ async function cleanBetterLetterProcessing({
   const normalizedCleanType = normalizeCleanType(cleanType);
   const cleanProfile = getCleanProfile(normalizedCleanType);
 
+  let sourceFolder = "";
+  let destinationFolder = "";
+  let totalDocuments = 0;
+  let matchedDocuments = 0;
+  let movedDocuments = 0;
+
   try {
     const scope = await resolveFilingScope(page);
     logger?.event("clean_scope_resolved", {
@@ -98,7 +104,7 @@ async function cleanBetterLetterProcessing({
       : [];
 
     // SOURCE
-    let sourceFolder = sourceInput;
+    sourceFolder = sourceInput;
     if (sourceFolder) {
       console.log(`✔ Enter SOURCE folder name to scan (exact match): ${sourceFolder}`);
       console.log(`🔎 Trying to load source folder: "${sourceFolder}"`);
@@ -142,7 +148,17 @@ async function cleanBetterLetterProcessing({
           pickerOptions,
         }
       );
-      if (!sourceFolder) return;
+      if (!sourceFolder) {
+        return {
+          outcome: "cancelled",
+          stage: "source_folder",
+          sourceFolder: "",
+          destinationFolder: "",
+          totalDocuments,
+          matchedDocuments,
+          movedDocuments,
+        };
+      }
     }
 
     // SCAN (strong selector)
@@ -150,6 +166,7 @@ async function cleanBetterLetterProcessing({
       "#document_list li a div strong, #document_list li a strong",
       (els) => els.map((e) => e.innerText.trim()).filter(Boolean)
     );
+    totalDocuments = allTitles.length;
 
     if (allTitles.length === 0) {
       throw new Error(
@@ -160,12 +177,13 @@ async function cleanBetterLetterProcessing({
     const titlesToMove = allTitles.filter((title) =>
       cleanProfile ? cleanProfile.shouldMoveTitle(title) : !UUID_REGEX.test(title)
     );
+    matchedDocuments = titlesToMove.length;
 
     logger?.event("clean_scan_complete", {
       cleanType: normalizedCleanType || "manual",
       sourceFolder,
-      totalDocuments: allTitles.length,
-      matchedDocuments: titlesToMove.length,
+      totalDocuments,
+      matchedDocuments,
     });
 
     console.log(`\n📄 Documents detected: ${allTitles.length}`);
@@ -173,7 +191,14 @@ async function cleanBetterLetterProcessing({
 
     if (!titlesToMove.length) {
       console.log("Nothing to move.");
-      return;
+      return {
+        outcome: "nothing_to_move",
+        sourceFolder,
+        destinationFolder: "",
+        totalDocuments,
+        matchedDocuments,
+        movedDocuments,
+      };
     }
 
     console.log("\nExamples:");
@@ -181,11 +206,18 @@ async function cleanBetterLetterProcessing({
 
     if (dryRun) {
       console.log("\n🟡 DRY RUN — no changes made.");
-      return;
+      return {
+        outcome: "dry_run",
+        sourceFolder,
+        destinationFolder: "",
+        totalDocuments,
+        matchedDocuments,
+        movedDocuments,
+      };
     }
 
     // DESTINATION
-    let destinationFolder = destinationInput;
+    destinationFolder = destinationInput;
     if (destinationFolder) {
       console.log(`✔ Enter destination folder name (exact match): ${destinationFolder}`);
       const found = await findFolderLinkWithOptions(scope, destinationFolder, {
@@ -225,7 +257,17 @@ async function cleanBetterLetterProcessing({
           pickerOptions,
         }
       );
-      if (!destinationFolder) return;
+      if (!destinationFolder) {
+        return {
+          outcome: "cancelled",
+          stage: "destination_folder",
+          sourceFolder,
+          destinationFolder: "",
+          totalDocuments,
+          matchedDocuments,
+          movedDocuments,
+        };
+      }
     }
 
     let proceed = autoConfirmMove;
@@ -242,7 +284,15 @@ async function cleanBetterLetterProcessing({
         throw new Error("Move confirmation required in non-interactive mode. Use --yes.");
       }
       console.log("Cancelled. No documents were moved.");
-      return;
+      return {
+        outcome: "cancelled",
+        stage: "move_confirmation",
+        sourceFolder,
+        destinationFolder,
+        totalDocuments,
+        matchedDocuments,
+        movedDocuments,
+      };
     }
 
     // Destination lookup can change the UI context in some tenants.
@@ -309,6 +359,7 @@ async function cleanBetterLetterProcessing({
       });
 
       remaining = remaining.slice(batchSize);
+      movedDocuments = matchedDocuments - remaining.length;
       batch++;
 
       if (remaining.length) {
@@ -318,13 +369,35 @@ async function cleanBetterLetterProcessing({
     }
 
     console.log("\n✔ All documents moved.");
+    return {
+      outcome: "success",
+      sourceFolder,
+      destinationFolder,
+      totalDocuments,
+      matchedDocuments,
+      movedDocuments,
+    };
   } catch (err) {
+    const failedDocuments = Math.max(matchedDocuments - movedDocuments, 0);
     logger?.event("clean_failed", {
       errorType: classifyError(err),
       errorMessage: err?.message || String(err),
+      totalDocuments,
+      matchedDocuments,
+      movedDocuments,
+      failedDocuments,
     });
     console.error("❌ CLEAN FAILED:", err.message);
     await page.screenshot({ path: "clean-failure.png", fullPage: true }).catch(() => {});
+    err.docmanCleanResult = {
+      outcome: "failed",
+      sourceFolder,
+      destinationFolder,
+      totalDocuments,
+      matchedDocuments,
+      movedDocuments,
+      failedDocuments,
+    };
     throw err;
   }
 }
