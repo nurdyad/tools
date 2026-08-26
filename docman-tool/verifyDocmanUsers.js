@@ -25,6 +25,11 @@ async function verifyDocmanUsers({ page, usernames }) {
     console.log(
       `⚠ Could not load Docman recipient groups, continuing with users only: ${error.message}`
     );
+    // The recipient-group pagination click can leave a navigation in flight
+    // when it fails mid-page (see readAllRecipientGroupNames below) - let it
+    // finish before starting a new one, or Playwright aborts this goto as
+    // "interrupted by another navigation".
+    await page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => {});
   }
 
   // Navigate to User List using the detected environment.
@@ -130,17 +135,26 @@ async function readAllRecipientGroupNames(page, baseUrl) {
   // anchor directly (a plain page.goto to the same href does not reliably
   // advance Docman's server-side paging state).
   for (const href of pageHrefs) {
-    const clicked = await page.evaluate((targetHref) => {
-      const link = document.querySelector(`a.dropdown-item[href="${targetHref}"]`);
-      if (!link) return false;
-      link.click();
-      return true;
-    }, href);
+    let clicked = false;
+    try {
+      clicked = await page.evaluate((targetHref) => {
+        const link = document.querySelector(`a.dropdown-item[href="${targetHref}"]`);
+        if (!link) return false;
+        link.click();
+        return true;
+      }, href);
+    } catch (error) {
+      // The click above can trigger navigation before this evaluate call
+      // finishes returning its result, which destroys the execution context
+      // mid-call - that's the click having worked, not a real failure, so
+      // treat it as clicked and fall through to wait for that navigation.
+      clicked = true;
+    }
     if (!clicked) continue;
 
     await page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => {});
     await page.waitForTimeout(300);
-    await addCurrentPageRows();
+    await addCurrentPageRows().catch(() => {});
   }
 
   return [...names];
