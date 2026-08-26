@@ -2085,3 +2085,4 @@ async function waitAndDismissBlockingDialogs(
 
 module.exports = bootstrapDocmanSession;
 module.exports.gotoDocmanFilingAndActivate = gotoDocmanFilingAndActivate;
+module.exports.isCdpAttachConnectionError = isCdpAttachConnectionError;
